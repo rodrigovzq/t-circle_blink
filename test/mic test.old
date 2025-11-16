@@ -1,0 +1,64 @@
+#include <Arduino.h>
+#include "FastLED.h"
+#include "pin_config.h"
+#include "Arduino_DriveBus_Library.h"
+
+// el led integrado es APA102
+#define DATA_PIN APA102_DATA
+#define CLOCK_PIN APA102_CLOCK
+// definición de la tasa de muestreo y bits de datos del microfono
+#define IIS_SAMPLE_RATE 44100
+#define IIS_DATA_BIT 16
+
+// colores para el led APA102
+static uint32_t APA102_RGB_Data[] = {CRGB::Red, CRGB::Green, CRGB::Blue, CRGB::Black};
+CRGB leds[1];
+// configuración del bus IIS para el micrófono MEMS MP34DT05TR
+std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
+    std::make_shared<Arduino_HWIIS>(I2S_NUM_0, MSM261_BCLK, MSM261_WS, MSM261_DATA);
+// creación del objeto micrófono
+std::unique_ptr<Arduino_IIS> Microphone(new Arduino_MEMS(IIS_Bus));
+// buffer de lectura de datos del micrófono
+char IIS_Read_Buff[100];
+
+void setup()
+{
+  FastLED.addLeds<APA102, DATA_PIN, CLOCK_PIN, BGR>(leds, 1);
+  FastLED.setBrightness(100);
+  Serial.begin(115200);
+  leds[0] = APA102_RGB_Data[0];
+  FastLED.show();
+  delay(500);
+  leds[0] = APA102_RGB_Data[2];
+  FastLED.show();
+  delay(500);
+  leds[0] = APA102_RGB_Data[3];
+  FastLED.show();
+  Serial.println("LED initalization complete");
+  Serial.println("Starting Microphone Initialization");
+
+  while (Microphone->begin(i2s_mode_t::I2S_MODE_MASTER, ad_iis_data_mode_t::AD_IIS_DATA_IN, i2s_channel_fmt_t::I2S_CHANNEL_FMT_RIGHT_LEFT,
+                           IIS_DATA_BIT, IIS_SAMPLE_RATE) == false)
+  {
+    Serial.println("Microphone initialization fail");
+    delay(2000);
+  }
+  Serial.println("Microphone initialization successfully");
+}
+
+void loop()
+{
+
+  if (Microphone->IIS_Read_Data(IIS_Read_Buff, 100) == true)
+  {
+    leds[0] = APA102_RGB_Data[0];
+    Serial.println((int16_t)(IIS_Read_Buff[0] | IIS_Read_Buff[1] << 8));
+  }
+  else
+  {
+    Serial.printf("Failed to read MSM261 data");
+    leds[0] = APA102_RGB_Data[2];
+  }
+  FastLED.show();
+  delay(50);
+}

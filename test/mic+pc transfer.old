@@ -1,0 +1,192 @@
+#include <Arduino.h>
+#include <LittleFS.h>
+#include "FastLED.h"
+#include "pin_config.h"
+#include "Arduino_DriveBus_Library.h"
+
+#define DATA_PIN APA102_DATA
+#define CLOCK_PIN APA102_CLOCK
+#define IIS_SAMPLE_RATE 44100
+#define IIS_DATA_BIT 16
+#define RECORD_SECONDS 4
+#define BUFFER_SIZE (IIS_SAMPLE_RATE * RECORD_SECONDS)
+#define BUTTON_PIN 0 // GPIO0 = BOOT
+
+CRGB leds[1];
+std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
+    std::make_shared<Arduino_HWIIS>(I2S_NUM_0, MSM261_BCLK, MSM261_WS, MSM261_DATA);
+std::unique_ptr<Arduino_IIS> Microphone(new Arduino_MEMS(IIS_Bus)); // Declaracion de Microphone como un puntero unico a un objeto Arduino_IIS
+
+int16_t *audioBuffer = nullptr;
+size_t writeIndex = 0;
+bool recording = false;
+
+void sendWavHeader(File &f, uint32_t sampleRate, uint32_t numSamples)
+{
+  uint32_t dataSize = numSamples * sizeof(int16_t);
+  f.write((const uint8_t *)"RIFF", 4);
+  uint32_t chunkSize = 36 + dataSize;
+  f.write((uint8_t *)&chunkSize, 4);
+  f.write((const uint8_t *)"WAVE", 4);
+  f.write((const uint8_t *)"fmt ", 4);
+  uint32_t subChunk1Size = 16;
+  uint16_t audioFormat = 1;
+  uint16_t numChannels = 1;
+  uint16_t bitsPerSample = 16;
+  uint32_t byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  uint16_t blockAlign = numChannels * bitsPerSample / 8;
+  f.write((uint8_t *)&subChunk1Size, 4);
+  f.write((uint8_t *)&audioFormat, 2);
+  f.write((uint8_t *)&numChannels, 2);
+  f.write((uint8_t *)&sampleRate, 4);
+  f.write((uint8_t *)&byteRate, 4);
+  f.write((uint8_t *)&blockAlign, 2);
+  f.write((uint8_t *)&bitsPerSample, 2);
+  f.write((const uint8_t *)"data", 4);
+  f.write((uint8_t *)&dataSize, 4);
+}
+void sendFileToSerial()
+{
+  File f = LittleFS.open("/record.wav", "r");
+  if (!f)
+  {
+    Serial.println("No hay archivo");
+    return;
+  }
+
+  Serial.println("INICIO_WAV");
+
+  uint8_t buf[512];
+  while (f.available())
+  {
+    size_t len = f.read(buf, 512);
+    Serial.write(buf, len);
+  }
+
+  Serial.println("\nFIN_WAV");
+  f.close();
+  Serial.println("✅ Envío completado");
+}
+
+void sendWavBinary()
+{
+  File f = LittleFS.open("/record.wav", "r");
+  if (!f)
+  {
+    Serial.println("No hay archivo");
+    return;
+  }
+
+  Serial.println("WAV_START");
+  Serial.flush();
+  delay(100);
+
+  // Enviar bytes crudos
+  while (f.available())
+  {
+    Serial.write(f.read());
+  }
+
+  Serial.flush();
+  delay(100);
+  Serial.println("\nWAV_END");
+  f.close();
+}
+void setup()
+{
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("❌ No se pudo montar LittleFS");
+    while (1)
+      ;
+  }
+  Serial.println("🗑️  Formateando LittleFS...");
+  LittleFS.format();
+  Serial.println("✅ Flash formateada");
+
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n🎙️  T-Circle S3 - Grabación 4s con botón BOOT");
+
+  FastLED.addLeds<APA102, DATA_PIN, CLOCK_PIN, BGR>(leds, 1);
+  FastLED.setBrightness(50);
+  leds[0] = CRGB::Blue;
+  FastLED.show();
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  audioBuffer = (int16_t *)ps_malloc(BUFFER_SIZE * sizeof(int16_t));
+  if (!audioBuffer)
+  {
+    Serial.println("❌ No se pudo reservar PSRAM");
+    while (1)
+      ;
+  }
+
+  while (!Microphone->begin(I2S_MODE_MASTER, AD_IIS_DATA_IN,
+                            I2S_CHANNEL_FMT_ONLY_LEFT, IIS_DATA_BIT, IIS_SAMPLE_RATE)) // Microphone es un puntero a un objeto Arduino_IIS que tiene la fucnion begin
+  {
+    Serial.println("❌ Micrófono no inicializado, reintentando...");
+    delay(2000);
+  }
+
+  leds[0] = CRGB::Green;
+  FastLED.show();
+  Serial.println("✅ Micrófono listo. Presioná BOOT para grabar 4 s...");
+}
+
+void loop()
+{
+  if (digitalRead(BUTTON_PIN) == LOW && !recording)
+  {
+    delay(50); // antirrebote
+    if (digitalRead(BUTTON_PIN) == LOW)
+    {
+      // Serial.println("🎧 Grabando 4 segundos...");
+      recording = true;
+      writeIndex = 0;
+      leds[0] = CRGB::Red;
+      FastLED.show();
+    }
+  }
+
+  if (recording)
+  {
+    unsigned long start = millis(); // Tiempo de inicio de la grabación en formato
+    while (millis() - start < RECORD_SECONDS * 1000)
+    {
+      int16_t sample;
+      if (Microphone->IIS_Read_Data((char *)&sample, sizeof(int16_t)))
+      {
+        if (writeIndex < BUFFER_SIZE)
+        {
+          audioBuffer[writeIndex++] = sample;
+        }
+      }
+    }
+
+    recording = false;
+    leds[0] = CRGB::Yellow;
+    FastLED.show();
+
+    File f = LittleFS.open("/record.wav", "w");
+    if (!f)
+    {
+      Serial.println("❌ Error abriendo archivo para escribir");
+    }
+    else
+    {
+
+      sendWavHeader(f, IIS_SAMPLE_RATE, writeIndex);
+      f.write((uint8_t *)audioBuffer, writeIndex * sizeof(int16_t));
+      f.close();
+      Serial.printf("✅ WAV guardado en Flash (%d muestras)\n", writeIndex);
+
+      Serial.println("Enviando (Binario): /record.wav");
+      sendWavBinary();
+    }
+
+    leds[0] = CRGB::Green;
+    FastLED.show();
+  }
+}

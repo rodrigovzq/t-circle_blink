@@ -1,0 +1,26 @@
+#include <Arduino.h>
+#include "FastLED.h"
+#include "pin_config.h"
+
+// el led integrado es APA102
+#define DATA_PIN APA102_DATA
+#define CLOCK_PIN APA102_CLOCK
+
+static uint32_t APA102_RGB_Data[] = {CRGB::Red, CRGB::Green, CRGB::Blue, CRGB::Black};
+CRGB leds[1];
+
+void setup()
+{
+  FastLED.addLeds<APA102, DATA_PIN, CLOCK_PIN, BGR>(leds, 1);
+  FastLED.setBrightness(50);
+}
+
+void loop()
+{
+  leds[0] = APA102_RGB_Data[0];
+  FastLED.show();
+  delay(250);
+  leds[0] = APA102_RGB_Data[2];
+  FastLED.show();
+  delay(250);
+}

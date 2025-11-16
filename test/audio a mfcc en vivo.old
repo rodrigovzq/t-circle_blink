@@ -1,0 +1,391 @@
+#include <Arduino.h>
+#include <LittleFS.h>
+#include "FastLED.h"
+#include "pin_config.h"
+#include "Arduino_DriveBus_Library.h"
+#include "arduinoFFT.h"
+
+#define DATA_PIN APA102_DATA
+#define CLOCK_PIN APA102_CLOCK
+#define BUTTON_PIN 0
+
+// Parámetros del modelo y audios
+#define SAMPLE_RATE 44100
+#define IIS_DATA_BIT 16
+#define DURATION_SEC 4
+#define N_SAMPLES (SAMPLE_RATE * DURATION_SEC)
+#define N_MFCC 128     // Número de coeficientes MFCC
+#define N_FFT 2048     // Tamaño de la FFT (es la default de Librosa que se uso para el entrenamiento)
+#define HOP_LENGTH 512 // Muestras entre frames
+#define N_FRAMES 345   // Número de frames temporales (sale del entrenamiento)
+#define N_MELS 128     // Número de filtros Mel (sale del entrenamiento)
+
+// Normalización de MFCCs (valores calculados del dataset de entrenamiento)
+#define MFCC_MEAN -3.419721f
+#define MFCC_STD 51.893776f
+
+CRGB leds[1];
+
+std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
+    std::make_shared<Arduino_HWIIS>(I2S_NUM_0, MSM261_BCLK, MSM261_WS, MSM261_DATA);
+std::unique_ptr<Arduino_IIS> Microphone(new Arduino_MEMS(IIS_Bus));
+
+// Buffers
+int16_t *audioBuffer = nullptr;
+float *mfccOutput = nullptr; // puntero de la matriz de floats de coef MFCCs
+size_t writeIndex = 0;
+bool recording = false;
+
+// FFT
+ArduinoFFT<float> FFT;
+float *vReal = nullptr;
+float *vImag = nullptr;
+
+// Mel filterbank y DCT
+float *melFilterbank = nullptr; // descorrela los coef MEL para obtener MFCCs
+float *dctMatrix = nullptr;     // matriz de transformada discreta coseno
+float *hammingWindow = nullptr; // reduce las discontinuidades en los bordes de los frames
+
+// Métricas
+unsigned long timeCapture = 0;
+unsigned long timeMFCC = 0;
+unsigned long timeTotal = 0;
+
+// ============================================
+// Inicialización de Hamming Window
+// ============================================
+void initHammingWindow()
+{
+  for (int i = 0; i < N_FFT; i++)
+  {
+    hammingWindow[i] = 0.54f - 0.46f * cos(2.0f * PI * i / (N_FFT - 1));
+  }
+  Serial.println("✅ Hamming window inicializada");
+}
+
+// ============================================
+// Inicialización de Mel Filterbank
+// ============================================
+void initMelFilterbank()
+{
+  auto hzToMel = [](float hz)
+  { return 2595.0f * log10(1.0f + hz / 700.0f); };
+  auto melToHz = [](float mel)
+  { return 700.0f * (pow(10.0f, mel / 2595.0f) - 1.0f); };
+
+  float melMin = hzToMel(0);
+  float melMax = hzToMel(SAMPLE_RATE / 2.0f);
+
+  // Crear N_MELS + 2 puntos en escala Mel
+  float melPoints[N_MELS + 2];
+  for (int i = 0; i < N_MELS + 2; i++)
+  {
+    melPoints[i] = melMin + (melMax - melMin) * i / (N_MELS + 1);
+  }
+
+  // Convertir a bins de FFT
+  int bins[N_MELS + 2];
+  for (int i = 0; i < N_MELS + 2; i++)
+  {
+    float hz = melToHz(melPoints[i]);
+    bins[i] = (int)floor((N_FFT + 1) * hz / SAMPLE_RATE);
+  }
+
+  // Construir filtros triangulares
+  memset(melFilterbank, 0, N_MELS * (N_FFT / 2 + 1) * sizeof(float));
+
+  for (int m = 0; m < N_MELS; m++)
+  {
+    int leftBin = bins[m];
+    int centerBin = bins[m + 1];
+    int rightBin = bins[m + 2];
+
+    // Rampa ascendente
+    for (int k = leftBin; k < centerBin; k++)
+    {
+      melFilterbank[m * (N_FFT / 2 + 1) + k] =
+          (float)(k - leftBin) / (centerBin - leftBin);
+    }
+
+    // Rampa descendente
+    for (int k = centerBin; k < rightBin; k++)
+    {
+      melFilterbank[m * (N_FFT / 2 + 1) + k] =
+          (float)(rightBin - k) / (rightBin - centerBin);
+    }
+  }
+
+  Serial.println("✅ Mel filterbank inicializada");
+}
+
+// ============================================
+// Inicialización de DCT Matrix
+// ============================================
+void initDCTMatrix()
+{
+  for (int i = 0; i < N_MFCC; i++)
+  {
+    for (int j = 0; j < N_MELS; j++)
+    {
+      dctMatrix[i * N_MELS + j] =
+          cos(PI * i * (j + 0.5f) / N_MELS) * sqrt(2.0f / N_MELS);
+    }
+  }
+  Serial.println("✅ DCT matrix inicializada");
+}
+
+// ============================================
+// Extraer MFCCs de un frame
+// ============================================
+void extractFrameMFCC(int frameIndex, float *mfccs)
+{
+  int offset = frameIndex * HOP_LENGTH;
+
+  // 1. Aplicar ventana y copiar a buffer FFT
+  for (int i = 0; i < N_FFT; i++)
+  {
+    if (offset + i < N_SAMPLES)
+    {
+      vReal[i] = audioBuffer[offset + i] * hammingWindow[i];
+    }
+    else
+    {
+      vReal[i] = 0;
+    }
+    vImag[i] = 0;
+  }
+
+  // 2. Calcular FFT
+  FFT.compute(vReal, vImag, N_FFT, FFTDirection::Forward);
+
+  // 3. Calcular magnitud (power spectrum)
+  float magnitude[N_FFT / 2 + 1];
+  for (int i = 0; i < N_FFT / 2 + 1; i++)
+  {
+    magnitude[i] = sqrt(vReal[i] * vReal[i] + vImag[i] * vImag[i]);
+  }
+
+  // 4. Aplicar Mel filterbank
+  float melEnergies[N_MELS];
+  for (int m = 0; m < N_MELS; m++)
+  {
+    float energy = 0.0f;
+    for (int k = 0; k < N_FFT / 2 + 1; k++)
+    {
+      energy += magnitude[k] * melFilterbank[m * (N_FFT / 2 + 1) + k];
+    }
+    melEnergies[m] = log(energy + 1e-10f); // Log con epsilon
+  }
+
+  // 5. Aplicar DCT
+  for (int i = 0; i < N_MFCC; i++)
+  {
+    float sum = 0.0f;
+    for (int j = 0; j < N_MELS; j++)
+    {
+      sum += melEnergies[j] * dctMatrix[i * N_MELS + j];
+    }
+    mfccs[i] = sum;
+  }
+}
+
+// ============================================
+// Procesar todo el audio a MFCCs
+// ============================================
+void processAudioToMFCC()
+{
+  Serial.println("\n🔄 Procesando audio a MFCCs...");
+
+  unsigned long startMFCC = millis();
+
+  float frameMFCCs[N_MFCC];
+
+  for (int frame = 0; frame < N_FRAMES; frame++)
+  {
+    // Extraer MFCCs del frame
+    extractFrameMFCC(frame, frameMFCCs);
+
+    // Normalizar y guardar en formato (128, 345)
+    for (int i = 0; i < N_MFCC; i++)
+    {
+      mfccOutput[i * N_FRAMES + frame] = (frameMFCCs[i] - MFCC_MEAN) / MFCC_STD;
+    }
+
+    // Progreso cada 50 frames
+    if (frame % 50 == 0)
+    {
+      Serial.printf("   Frame %d/%d (%.1f%%)\n", frame, N_FRAMES, frame * 100.0f / N_FRAMES);
+    }
+  }
+
+  timeMFCC = millis() - startMFCC;
+  Serial.printf("✅ MFCCs extraídos en %lu ms\n", timeMFCC);
+}
+
+// ============================================
+// Mostrar métricas
+// ============================================
+void printMetrics()
+{
+  Serial.println("\n📊 ═══════════════════════════════════════");
+  Serial.println("   MÉTRICAS DE PROCESAMIENTO");
+  Serial.println("   ═══════════════════════════════════════");
+
+  Serial.printf("   🎤 Captura de audio:     %5lu ms\n", timeCapture);
+  Serial.printf("   🔊 Extracción MFCCs:     %5lu ms\n", timeMFCC);
+  Serial.println("   ───────────────────────────────────────");
+  Serial.printf("   ⏱️  TOTAL:                %5lu ms\n", timeTotal);
+
+  Serial.println("\n   📈 Desglose porcentual:");
+  Serial.printf("   Captura:   %.1f%%\n", (timeCapture * 100.0f) / timeTotal);
+  Serial.printf("   MFCCs:     %.1f%%\n", (timeMFCC * 100.0f) / timeTotal);
+
+  Serial.println("\n   💾 Uso de memoria:");
+  Serial.printf("   Audio buffer:    %d KB\n", (N_SAMPLES * sizeof(int16_t)) / 1024);
+  Serial.printf("   MFCC output:     %d KB\n", (N_MFCC * N_FRAMES * sizeof(float)) / 1024);
+  Serial.printf("   PSRAM libre:     %d KB\n",
+                heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+
+  Serial.println("\n   📐 Dimensiones:");
+  Serial.printf("   Audio:    %d samples\n", N_SAMPLES);
+  Serial.printf("   MFCCs:    %d x %d\n", N_MFCC, N_FRAMES);
+  Serial.printf("   Primeros 5 MFCCs del frame 0:\n");
+  for (int i = 0; i < 5; i++)
+  {
+    Serial.printf("      [%d][0] = %.4f\n", i, mfccOutput[i * N_FRAMES]);
+  }
+
+  Serial.println("   ═══════════════════════════════════════\n");
+}
+
+// ============================================
+// Setup
+// ============================================
+void setup()
+{
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n🎙️  MoodLink - Test MFCC + Métricas");
+  Serial.println("═══════════════════════════════════════");
+
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("❌ No se pudo montar LittleFS");
+    while (1)
+      ;
+  }
+
+  FastLED.addLeds<APA102, DATA_PIN, CLOCK_PIN, BGR>(leds, 1);
+  FastLED.setBrightness(50);
+  leds[0] = CRGB::Blue;
+  FastLED.show();
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Reservar memoria en PSRAM
+  Serial.println("\n💾 Reservando memoria PSRAM...");
+
+  audioBuffer = (int16_t *)ps_malloc(N_SAMPLES * sizeof(int16_t));
+  mfccOutput = (float *)ps_malloc(N_MFCC * N_FRAMES * sizeof(float));
+  vReal = (float *)ps_malloc(N_FFT * sizeof(float));
+  vImag = (float *)ps_malloc(N_FFT * sizeof(float));
+  melFilterbank = (float *)ps_malloc(N_MELS * (N_FFT / 2 + 1) * sizeof(float));
+  dctMatrix = (float *)ps_malloc(N_MFCC * N_MELS * sizeof(float));
+  hammingWindow = (float *)ps_malloc(N_FFT * sizeof(float));
+
+  if (!audioBuffer || !mfccOutput || !vReal || !vImag ||
+      !melFilterbank || !dctMatrix || !hammingWindow)
+  {
+    Serial.println("❌ Error: No se pudo reservar PSRAM");
+    while (1)
+      ;
+  }
+
+  Serial.printf("✅ PSRAM reservada: %d KB\n",
+                (N_SAMPLES * sizeof(int16_t) + N_MFCC * N_FRAMES * sizeof(float) +
+                 2 * N_FFT * sizeof(float) + N_MELS * (N_FFT / 2 + 1) * sizeof(float) +
+                 N_MFCC * N_MELS * sizeof(float) + N_FFT * sizeof(float)) /
+                    1024);
+
+  // Inicializar micrófono
+  Serial.println("\n🎤 Inicializando micrófono I2S...");
+  while (!Microphone->begin(I2S_MODE_MASTER, AD_IIS_DATA_IN,
+                            I2S_CHANNEL_FMT_ONLY_LEFT, IIS_DATA_BIT, SAMPLE_RATE))
+  {
+    Serial.println("❌ Micrófono no inicializado, reintentando...");
+    delay(2000);
+  }
+  Serial.println("✅ Micrófono listo");
+
+  // Inicializar matrices de preprocesamiento
+  Serial.println("\n🔧 Inicializando matrices MFCC...");
+  initHammingWindow();
+  initMelFilterbank();
+  initDCTMatrix();
+
+  leds[0] = CRGB::Green;
+  FastLED.show();
+
+  Serial.println("\n✅ Sistema listo");
+  Serial.println("═══════════════════════════════════════");
+  Serial.println("Presioná BTN para grabar 4s y procesar\n");
+}
+
+// ============================================
+// Loop
+// ============================================
+void loop()
+{
+  // Detectar botón
+  if (digitalRead(BUTTON_PIN) == LOW && !recording)
+  {
+    delay(50); // antirrebote
+    if (digitalRead(BUTTON_PIN) == LOW)
+    {
+      recording = true;
+      writeIndex = 0;
+
+      Serial.println("\n🔴 GRABANDO.");
+      leds[0] = CRGB::Red;
+      FastLED.show();
+
+      unsigned long startTotal = millis();
+      unsigned long startCapture = millis();
+
+      // Capturar audio
+      unsigned long captureStart = millis();
+      while (millis() - captureStart < DURATION_SEC * 1000)
+      {
+        int16_t sample;
+        if (Microphone->IIS_Read_Data((char *)&sample, sizeof(int16_t)))
+        {
+          if (writeIndex < N_SAMPLES)
+          {
+            audioBuffer[writeIndex++] = sample;
+          }
+        }
+      }
+
+      timeCapture = millis() - startCapture;
+      Serial.printf("✅ Captura completada: %d samples en %lu ms\n",
+                    writeIndex, timeCapture);
+      Serial.printf("🟡 Comienza procesamiento");
+      leds[0] = CRGB::Yellow;
+      FastLED.show();
+
+      // Procesar a MFCCs
+      processAudioToMFCC();
+
+      timeTotal = millis() - startTotal;
+
+      // Mostrar métricas
+      printMetrics();
+
+      recording = false;
+      leds[0] = CRGB::Green;
+      FastLED.show();
+
+      Serial.println("🟢 Listo para otra grabación\n");
+    }
+  }
+}
