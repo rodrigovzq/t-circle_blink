@@ -1,21 +1,26 @@
-#include <Arduino.h>
-#include <LittleFS.h>
+// MoodLink v3.0 - ESP-IDF + esp-tflite-micro migration
+// Optimized with ESP-NN hardware acceleration
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_spiffs.h"
+#include "esp_system.h"
+
+// TensorFlow Lite Micro headers
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/system_setup.h"
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/micro/micro_error_reporter.h"
-#include "esp_task_wdt.h"
+#include "tensorflow/lite/micro/micro_log.h"
 
-// === CACHE MANAGEMENT para PSRAM ===
-#include "esp_heap_caps.h"
+#define VERSION "v3.0-espidf-migration"
 
-// Declaraciones de funciones ROM de caché (ESP32-S3)
-extern "C" {
-  void Cache_WriteBack_All(void);
-}
-
-#define VERSION "v2.2-cache-management"
+static const char *TAG = "MoodLink";
 
 // TFLite globals
 namespace
@@ -27,75 +32,107 @@ namespace
 
   constexpr int kTensorArenaSize = 7 * 1024 * 1024; // 7 MB
   uint8_t *tensor_arena = nullptr;
-  size_t actual_arena_size = 0; // Tamaño real asignado
+  size_t actual_arena_size = 0;
 
-  tflite::ErrorReporter *error_reporter = nullptr;
+#ifdef CONFIG_NN_OPTIMIZED
+  constexpr int kScratchBufferSize = 60 * 1024; // 60 KB for ESP-NN optimizations
+  uint8_t *scratch_buffer = nullptr;
+#endif
 }
 
 // Nombres de emociones
 const char *emotion_labels[] = {
     "angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"};
 
-void setup()
+// Initialize SPIFFS for model storage
+static esp_err_t init_spiffs(void)
 {
-  Serial.begin(115200);
-  delay(2000);
+  ESP_LOGI(TAG, "Initializing SPIFFS");
 
-  Serial.println("\n🧠 MoodLink - Test TFLite (Fase 2)");
-  Serial.println("════════════════════════════════════");
-  Serial.printf("📌 VERSION: %s\n", VERSION);
-  Serial.println("════════════════════════════════════");
+  esp_vfs_spiffs_conf_t conf = {
+    .base_path = "/spiffs",
+    .partition_label = NULL,
+    .max_files = 5,
+    .format_if_mount_failed = false
+  };
 
-  // 1. Montar LittleFS
-  Serial.println("\n📂 Montando LittleFS...");
-  if (!LittleFS.begin(true))
-  {
-    Serial.println("❌ Error montando LittleFS");
-    while (1)
-      ;
-  }
-  Serial.println("✅ LittleFS OK");
-
-  // 2. Cargar modelo
-  Serial.println("\n📦 Cargando modelo...");
-  File modelFile = LittleFS.open("/ser_cnn_int8.tflite", "r");
-  if (!modelFile)
-  {
-    Serial.println("❌ No se pudo abrir modelo");
-    while (1)
-      ;
+  esp_err_t ret = esp_vfs_spiffs_register(&conf);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
+    return ret;
   }
 
-  size_t modelSize = modelFile.size();
-  Serial.printf("   Tamaño: %d bytes\n", modelSize);
-
-  uint8_t *modelBuffer = (uint8_t *)ps_malloc(modelSize);
-  if (!modelBuffer)
-  {
-    Serial.println("❌ No hay PSRAM para modelo");
-    while (1)
-      ;
+  size_t total = 0, used = 0;
+  ret = esp_spiffs_info(NULL, &total, &used);
+  if (ret == ESP_OK) {
+    ESP_LOGI(TAG, "SPIFFS: %d KB total, %d KB used", total / 1024, used / 1024);
   }
 
-  modelFile.read(modelBuffer, modelSize);
-  modelFile.close();
-  Serial.println("✅ Modelo cargado en PSRAM");
+  return ESP_OK;
+}
 
-  // 3. Inicializar TFLite
-  Serial.println("\n🔧 Inicializando TFLite...");
+// Initialize TensorFlow Lite model
+static void init_tflite(void)
+{
+  ESP_LOGI(TAG, "\n🧠 MoodLink - TFLite Inference Test");
+  ESP_LOGI(TAG, "════════════════════════════════════");
+  ESP_LOGI(TAG, "📌 VERSION: %s", VERSION);
+  ESP_LOGI(TAG, "════════════════════════════════════");
+
+  // 1. Mount SPIFFS
+  ESP_LOGI(TAG, "\n📂 Mounting SPIFFS...");
+  if (init_spiffs() != ESP_OK) {
+    ESP_LOGE(TAG, "❌ Error mounting SPIFFS");
+    abort();
+  }
+  ESP_LOGI(TAG, "✅ SPIFFS OK");
+
+  // 2. Load model from SPIFFS
+  ESP_LOGI(TAG, "\n📦 Loading model...");
+  FILE *modelFile = fopen("/spiffs/ser_cnn_int8.tflite", "rb");
+  if (!modelFile) {
+    ESP_LOGE(TAG, "❌ Cannot open model file");
+    abort();
+  }
+
+  // Get file size
+  fseek(modelFile, 0, SEEK_END);
+  size_t modelSize = ftell(modelFile);
+  fseek(modelFile, 0, SEEK_SET);
+  ESP_LOGI(TAG, "   Size: %d bytes", modelSize);
+
+  // Allocate buffer in PSRAM
+  uint8_t *modelBuffer = (uint8_t *)heap_caps_malloc(modelSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!modelBuffer) {
+    ESP_LOGE(TAG, "❌ No PSRAM available for model");
+    fclose(modelFile);
+    abort();
+  }
+
+  // Read model into buffer
+  size_t bytes_read = fread(modelBuffer, 1, modelSize, modelFile);
+  fclose(modelFile);
+
+  if (bytes_read != modelSize) {
+    ESP_LOGE(TAG, "❌ Failed to read model (%d/%d bytes)", bytes_read, modelSize);
+    abort();
+  }
+
+  ESP_LOGI(TAG, "✅ Model loaded into PSRAM");
+
+  // 3. Initialize TFLite
+  ESP_LOGI(TAG, "\n🔧 Initializing TFLite...");
 
   model = tflite::GetModel(modelBuffer);
-  if (model->version() != TFLITE_SCHEMA_VERSION)
-  {
-    Serial.printf("❌ Versión incorrecta: modelo=%d, esperado=%d\n",
-                  model->version(), TFLITE_SCHEMA_VERSION);
-    while (1)
-      ;
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    ESP_LOGE(TAG, "❌ Incorrect version: model=%d, expected=%d",
+             model->version(), TFLITE_SCHEMA_VERSION);
+    abort();
   }
-  Serial.println("✅ Modelo compatible");
+  ESP_LOGI(TAG, "✅ Model compatible (schema v%d)", TFLITE_SCHEMA_VERSION);
 
-  // 4. Crear OpResolver
-  static tflite::MicroMutableOpResolver<12> resolver;
+  // 4. Create OpResolver with all required operations
+  static tflite::MicroMutableOpResolver<15> resolver;
   resolver.AddConv2D();
   resolver.AddMaxPool2D();
   resolver.AddFullyConnected();
@@ -106,215 +143,186 @@ void setup()
   resolver.AddDequantize();
   resolver.AddMul();
   resolver.AddAdd();
-  resolver.AddAveragePool2D();   // NUEVO
-  resolver.AddPad();             // NUEVO
-  resolver.AddRelu();            // NUEVO
-  resolver.AddLogistic();        // NUEVO
-  resolver.AddRelu6();           // NUEVO
-  resolver.AddDepthwiseConv2D(); // NUEVO - por si acaso
-  Serial.println("✅ OpResolver configurado");
+  resolver.AddAveragePool2D();
+  resolver.AddPad();
+  resolver.AddRelu();
+  resolver.AddLogistic();
+  resolver.AddRelu6();
+  resolver.AddDepthwiseConv2D();
+  ESP_LOGI(TAG, "✅ OpResolver configured (15 operations)");
 
-  // 5. Reservar tensor arena
-  // === CAMBIO CRÍTICO: Intentar RAM interna primero ===
-  Serial.println("\n💾 Intentando asignar tensor arena en RAM interna...");
+  // 5. Allocate tensor arena in PSRAM
+  ESP_LOGI(TAG, "\n💾 Allocating tensor arena...");
 
-  // Intentar con arena reducida en RAM interna (sin cache coherency issues)
-  constexpr int kReducedArenaSize = 512 * 1024; // 512 KB
-  tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kReducedArenaSize,
-                                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  tensor_arena = (uint8_t *)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
-  if (tensor_arena) {
-    actual_arena_size = kReducedArenaSize;
-    Serial.printf("✅ Tensor arena en RAM INTERNA: %d KB\n", actual_arena_size / 1024);
-    Serial.println("   ⚠️  NOTA: Arena reducida, puede fallar AllocateTensors()");
-  } else {
-    // Fallback a PSRAM con DMA capability (bypass cache)
-    Serial.println("⚠️  RAM interna insuficiente, usando PSRAM...");
-    Serial.println("   🔧 Intentando PSRAM con acceso DMA (sin caché)...");
-
-    // Intento 1: PSRAM con DMA (puede bypasear caché)
-    tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize,
-                                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-
-    if (!tensor_arena) {
-      // Intento 2: PSRAM normal
-      Serial.println("   ⚠️  DMA fallback, usando PSRAM estándar...");
-      tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM);
-    }
-
-    if (!tensor_arena) {
-      Serial.println("❌ No hay memoria disponible para tensor arena");
-      while (1);
-    }
-    actual_arena_size = kTensorArenaSize;
-    Serial.printf("✅ Tensor arena en PSRAM: %d KB\n", actual_arena_size / 1024);
-    Serial.println("   ⚠️  ADVERTENCIA: PSRAM con cache management experimental");
+  if (!tensor_arena) {
+    ESP_LOGE(TAG, "❌ Failed to allocate tensor arena (%d KB)", kTensorArenaSize / 1024);
+    abort();
   }
 
-  // 6. Crear error reporter
-  error_reporter = tflite::GetMicroErrorReporter();
+  actual_arena_size = kTensorArenaSize;
+  ESP_LOGI(TAG, "✅ Tensor arena allocated: %d KB in PSRAM", actual_arena_size / 1024);
 
-  // 7. Crear intérprete
+#ifdef CONFIG_NN_OPTIMIZED
+  // Allocate scratch buffer for ESP-NN optimizations
+  ESP_LOGI(TAG, "💾 Allocating scratch buffer for ESP-NN...");
+  scratch_buffer = (uint8_t *)heap_caps_malloc(kScratchBufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+  if (!scratch_buffer) {
+    ESP_LOGW(TAG, "⚠️  Failed to allocate scratch buffer, continuing without it");
+  } else {
+    ESP_LOGI(TAG, "✅ Scratch buffer allocated: %d KB", kScratchBufferSize / 1024);
+  }
+#endif
+
+  // 6. Create interpreter
+  ESP_LOGI(TAG, "🔧 Creating interpreter...");
   static tflite::MicroInterpreter static_interpreter(
-      model, resolver, tensor_arena, actual_arena_size, error_reporter);
+      model, resolver, tensor_arena, actual_arena_size);
   interpreter = &static_interpreter;
 
   TfLiteStatus allocate_status = interpreter->AllocateTensors();
-  if (allocate_status != kTfLiteOk)
-  {
-    Serial.println("❌ Error al asignar tensors");
-    while (1)
-      ;
+  if (allocate_status != kTfLiteOk) {
+    ESP_LOGE(TAG, "❌ Failed to allocate tensors");
+    abort();
   }
-  Serial.println("✅ Intérprete creado");
+  ESP_LOGI(TAG, "✅ Interpreter created successfully");
 
-  // 8. Obtener tensors
+  // 7. Get input/output tensors
   input = interpreter->input(0);
   output = interpreter->output(0);
 
-  Serial.println("\n📐 Información del modelo:");
-  Serial.printf("   Input shape: [%d, %d, %d, %d]\n",
-                input->dims->data[0], input->dims->data[1],
-                input->dims->data[2], input->dims->data[3]);
-  Serial.printf("   Input type: %s\n",
-                input->type == kTfLiteInt8 ? "INT8" : "FLOAT32");
-  Serial.printf("   Output shape: [%d, %d]\n",
-                output->dims->data[0], output->dims->data[1]);
-  Serial.printf("   Output type: %s\n",
-                output->type == kTfLiteInt8 ? "INT8" : "FLOAT32");
+  ESP_LOGI(TAG, "\n📐 Model information:");
+  ESP_LOGI(TAG, "   Input shape: [%d, %d, %d, %d]",
+           input->dims->data[0], input->dims->data[1],
+           input->dims->data[2], input->dims->data[3]);
+  ESP_LOGI(TAG, "   Input type: %s",
+           input->type == kTfLiteInt8 ? "INT8" : "FLOAT32");
+  ESP_LOGI(TAG, "   Output shape: [%d, %d]",
+           output->dims->data[0], output->dims->data[1]);
+  ESP_LOGI(TAG, "   Output type: %s",
+           output->type == kTfLiteInt8 ? "INT8" : "FLOAT32");
 
-  Serial.println("\n✅ FASE 1 COMPLETADA");
-  Serial.println("════════════════════════════════════");
+  ESP_LOGI(TAG, "\n✅ PHASE 1 COMPLETED");
+  ESP_LOGI(TAG, "════════════════════════════════════");
 
-  delay(2000);
+  vTaskDelay(pdMS_TO_TICKS(1000));
 
   // ════════════════════════════════════
-  // FASE 2: INFERENCIA DUMMY
+  // PHASE 2: DUMMY INFERENCE
   // ════════════════════════════════════
 
-  Serial.println("\n🎲 FASE 2: Inferencia con datos aleatorios");
-  Serial.println("════════════════════════════════════");
+  ESP_LOGI(TAG, "\n🎲 PHASE 2: Inference with random data");
+  ESP_LOGI(TAG, "════════════════════════════════════");
 
-  // 9. Llenar input con datos aleatorios
-  Serial.println("\n🎲 Generando datos de entrada aleatorios...");
+  // 8. Fill input with random data
+  ESP_LOGI(TAG, "\n🎲 Generating random input data...");
 
   int input_size = input->dims->data[1] * input->dims->data[2] * input->dims->data[3];
-  Serial.printf("   Total elementos input: %d\n", input_size);
+  ESP_LOGI(TAG, "   Total input elements: %d", input_size);
 
-  // Modelo int8: usar valores en rango [-128, 127]
-  for (int i = 0; i < input_size; i++)
-  {
-    input->data.int8[i] = random(-128, 128);
+  // Model int8: use values in range [-128, 127]
+  for (int i = 0; i < input_size; i++) {
+    input->data.int8[i] = (esp_random() % 256) - 128;
   }
-  Serial.println("✅ Input tensor llenado con datos random");
+  ESP_LOGI(TAG, "✅ Input tensor filled with random data");
 
-  // 10. Ejecutar inferencia
-  Serial.println("\n🧠 Ejecutando inferencia...");
+  // 9. Run inference
+  ESP_LOGI(TAG, "\n🧠 Running inference...");
 
-  // === DEBUG: Test de acceso a memoria ===
-  Serial.println("\n🔍 DEBUG: Validando acceso a tensor_arena...");
-  volatile uint8_t test_val = tensor_arena[0];
-  tensor_arena[0] = 0xAA;
-  if (tensor_arena[0] != 0xAA) {
-    Serial.println("❌ ERROR: PSRAM write/read failed!");
-    while(1);
-  }
-  tensor_arena[0] = test_val;
-  Serial.println("✅ Tensor arena accesible");
+  // Memory status before inference
+  ESP_LOGI(TAG, "\n📊 Memory status PRE-INVOKE:");
+  ESP_LOGI(TAG, "   Free heap: %d bytes", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  ESP_LOGI(TAG, "   Free PSRAM: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  ESP_LOGI(TAG, "   Largest free block: %d bytes", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
-  // === DEBUG: Estado de memoria antes de Invoke() ===
-  Serial.println("\n📊 Estado de memoria PRE-INVOKE:");
-  Serial.printf("   Free heap: %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("   Free PSRAM: %d bytes\n", ESP.getFreePsram());
-  Serial.printf("   Largest free block: %d bytes\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-  Serial.flush();
+  ESP_LOGI(TAG, "\n⏱️  Starting Invoke() with ESP-NN optimizations...");
 
-  // Desactivar watchdog durante inferencia
-  esp_task_wdt_init(60, false); // 60 segundos sin watchdog
-
-  // === CACHE MANAGEMENT: CRITICAL FIX para PSRAM ===
-  Serial.println("\n🔄 Sincronizando caché con PSRAM...");
-
-  // ESP32-S3: Forzar writeback de todas las líneas de caché a PSRAM
-  Cache_WriteBack_All();
-  Serial.println("   ✅ Cache writeback completado");
-  Serial.println("   ⚠️  NOTA: Cache writeback solo ayuda parcialmente");
-  Serial.println("   ⚠️  Si se cuelga, el problema es acceso durante ejecución de Conv2D");
-
-  Serial.flush();
-  delay(100); // Dar tiempo para que se complete el sync
-
-  Serial.println("\n⏱️  Iniciando Invoke() - Si se cuelga aquí, revisa serial...");
-  Serial.flush();
-
-  unsigned long start = millis();
+  // High-precision timing
+  int64_t start_time = esp_timer_get_time();
   TfLiteStatus invoke_status = interpreter->Invoke();
-  unsigned long elapsed = millis() - start;
+  int64_t end_time = esp_timer_get_time();
+  int64_t elapsed_us = end_time - start_time;
 
-  Serial.println("✅ Invoke() COMPLETADO!");
-  Serial.flush();
-
-  esp_task_wdt_init(5, true); // 5 segundos normal
-
-  // === DEBUG: Estado de memoria después de Invoke() ===
-  Serial.println("\n📊 Estado de memoria POST-INVOKE:");
-  Serial.printf("   Free heap: %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("   Free PSRAM: %d bytes\n", ESP.getFreePsram());
-  Serial.flush();
-
-  if (invoke_status != kTfLiteOk)
-  {
-    Serial.println("❌ Error durante la inferencia");
-    while (1)
-      ;
+  if (invoke_status != kTfLiteOk) {
+    ESP_LOGE(TAG, "❌ Error during inference");
+    abort();
   }
 
-  Serial.printf("✅ Inferencia completada en %lu ms\n", elapsed);
+  ESP_LOGI(TAG, "✅ Invoke() COMPLETED!");
 
-  // 11. Leer resultados
-  Serial.println("\n📊 Resultados (probabilidades):");
-  Serial.println("════════════════════════════════════");
+  // Memory status after inference
+  ESP_LOGI(TAG, "\n📊 Memory status POST-INVOKE:");
+  ESP_LOGI(TAG, "   Free heap: %d bytes", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  ESP_LOGI(TAG, "   Free PSRAM: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-  // Output es int8, necesitamos dequantizar
+  // Convert to human-readable format
+  float elapsed_ms = elapsed_us / 1000.0f;
+  float elapsed_sec = elapsed_ms / 1000.0f;
+
+  ESP_LOGI(TAG, "\n✅ Inference completed:");
+  ESP_LOGI(TAG, "   Time: %.2f ms (%.2f seconds)", elapsed_ms, elapsed_sec);
+
+  if (elapsed_sec >= 60) {
+    ESP_LOGI(TAG, "   (%.2f minutes)", elapsed_sec / 60.0f);
+  }
+
+  // 10. Read and display results
+  ESP_LOGI(TAG, "\n📊 Results (probabilities):");
+  ESP_LOGI(TAG, "════════════════════════════════════");
+
+  // Output is int8, need to dequantize
   float scale = output->params.scale;
   int zero_point = output->params.zero_point;
 
-  Serial.printf("   Output quantization: scale=%.6f, zero_point=%d\n\n",
-                scale, zero_point);
+  ESP_LOGI(TAG, "   Output quantization: scale=%.6f, zero_point=%d\n", scale, zero_point);
 
   int max_idx = 0;
   float max_prob = -1000.0f;
 
-  for (int i = 0; i < 7; i++)
-  {
-    // Dequantizar: float = (int8 - zero_point) * scale
+  for (int i = 0; i < 7; i++) {
+    // Dequantize: float = (int8 - zero_point) * scale
     int8_t quant_value = output->data.int8[i];
     float prob = (quant_value - zero_point) * scale;
 
-    Serial.printf("   %-10s: %6.2f%% (quant: %4d)\n",
-                  emotion_labels[i], prob * 100, quant_value);
+    ESP_LOGI(TAG, "   %-10s: %6.2f%% (quant: %4d)",
+             emotion_labels[i], prob * 100, quant_value);
 
-    if (prob > max_prob)
-    {
+    if (prob > max_prob) {
       max_prob = prob;
       max_idx = i;
     }
   }
 
-  Serial.println("   ────────────────────────────────");
-  Serial.printf("   🎯 Emoción predicha: %s (%.2f%%)\n",
-                emotion_labels[max_idx], max_prob * 100);
-  Serial.println("   ────────────────────────────────");
+  ESP_LOGI(TAG, "   ────────────────────────────────");
+  ESP_LOGI(TAG, "   🎯 Predicted emotion: %s (%.2f%%)",
+           emotion_labels[max_idx], max_prob * 100);
+  ESP_LOGI(TAG, "   ────────────────────────────────");
 
-  Serial.println("\n💡 Nota: Los datos de entrada son aleatorios,");
-  Serial.println("   así que el resultado no tiene sentido real.");
-  Serial.println("   El objetivo es verificar que la inferencia funciona.\n");
+  ESP_LOGI(TAG, "\n💡 Note: Input data is random,");
+  ESP_LOGI(TAG, "   so the result has no real meaning.");
+  ESP_LOGI(TAG, "   The goal is to verify that inference works.\n");
 
-  Serial.println("✅ FASE 2 COMPLETADA");
-  Serial.println("════════════════════════════════════");
+  ESP_LOGI(TAG, "✅ PHASE 2 COMPLETED");
+  ESP_LOGI(TAG, "════════════════════════════════════");
+
+  // Performance comparison
+  float speedup = 339000.0f / elapsed_ms; // baseline was 339 seconds
+  ESP_LOGI(TAG, "\n🚀 PERFORMANCE IMPROVEMENT:");
+  ESP_LOGI(TAG, "   Baseline (v2.2): 339.0 seconds");
+  ESP_LOGI(TAG, "   Current (v3.0):  %.2f seconds", elapsed_sec);
+  ESP_LOGI(TAG, "   Speedup: %.1fx faster!", speedup);
 }
 
-void loop()
+// ESP-IDF entry point
+extern "C" void app_main(void)
 {
-  delay(1000);
+  // Initialize and run TFLite inference
+  init_tflite();
+
+  // Keep running
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
 }

@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File
+## MoodLink v3.0 - Component dependencies
+
+dependencies:
+  espressif/esp-tflite-micro:
+    version: "^1.3.0"
+    # Incluye optimizaciones ESP-NN automáticamente

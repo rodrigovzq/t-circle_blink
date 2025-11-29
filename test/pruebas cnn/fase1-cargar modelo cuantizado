@@ -1,0 +1,152 @@
+#include <Arduino.h>
+#include <LittleFS.h>
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/system_setup.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+
+// TFLite globals
+namespace
+{
+  const tflite::Model *model = nullptr;
+  tflite::MicroInterpreter *interpreter = nullptr;
+  TfLiteTensor *input = nullptr;
+  TfLiteTensor *output = nullptr;
+
+  constexpr int kTensorArenaSize = 5 * 1024 * 1024; // 5 MB
+  uint8_t *tensor_arena = nullptr;
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println("\n🧠 MoodLink - Test TFLite (Fase 1)");
+  Serial.println("════════════════════════════════════");
+
+  // 1. Montar LittleFS
+  Serial.println("\n📂 Montando LittleFS...");
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("❌ Error montando LittleFS");
+    while (1)
+      ;
+  }
+  Serial.println("✅ LittleFS OK");
+
+  // 2. Cargar modelo
+  Serial.println("\n📦 Cargando modelo...");
+  File modelFile = LittleFS.open("/ser_cnn_int8.tflite", "r");
+  if (!modelFile)
+  {
+    Serial.println("❌ No se pudo abrir modelo");
+    while (1)
+      ;
+  }
+
+  size_t modelSize = modelFile.size();
+  Serial.printf("   Tamaño: %d bytes\n", modelSize);
+
+  uint8_t *modelBuffer = (uint8_t *)ps_malloc(modelSize);
+  if (!modelBuffer)
+  {
+    Serial.println("❌ No hay PSRAM para modelo");
+    while (1)
+      ;
+  }
+
+  modelFile.read(modelBuffer, modelSize);
+  modelFile.close();
+  Serial.println("✅ Modelo cargado en PSRAM");
+
+  // 3. Inicializar TFLite
+  Serial.println("\n🔧 Inicializando TFLite...");
+
+  model = tflite::GetModel(modelBuffer);
+  if (model->version() != TFLITE_SCHEMA_VERSION)
+  {
+    Serial.printf("❌ Versión incorrecta: modelo=%d, esperado=%d\n",
+                  model->version(), TFLITE_SCHEMA_VERSION);
+    while (1)
+      ;
+  }
+  Serial.println("✅ Modelo compatible");
+
+  // 4. Crear OpResolver
+  static tflite::MicroMutableOpResolver<10> resolver;
+  resolver.AddConv2D();
+  resolver.AddMaxPool2D();
+  resolver.AddFullyConnected();
+  resolver.AddSoftmax();
+  resolver.AddReshape();
+  resolver.AddMean();
+  resolver.AddQuantize();
+  resolver.AddDequantize();
+  resolver.AddMul();
+  resolver.AddAdd();
+  Serial.println("✅ OpResolver configurado");
+
+  // 5. Reservar tensor arena
+  tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM);
+  if (!tensor_arena)
+  {
+    Serial.println("❌ No hay PSRAM para tensor arena");
+    while (1)
+      ;
+  }
+
+  // Verificar alineación
+  if (((uintptr_t)tensor_arena % 16) != 0)
+  {
+    Serial.println("❌ Tensor arena no alineado");
+    while (1)
+      ;
+  }
+
+  Serial.printf("✅ Tensor arena: %d KB (alineado a 16 bytes)\n", kTensorArenaSize / 1024);
+  Serial.printf("   Dirección: 0x%08x\n", (uintptr_t)tensor_arena);
+  Serial.printf("   Tamaño: %d bytes\n", kTensorArenaSize);
+  // 6. Crear intérprete
+  static tflite::ErrorReporter *error_reporter = tflite::GetMicroErrorReporter();
+
+  static tflite::MicroInterpreter static_interpreter(
+      model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
+
+  interpreter = &static_interpreter;
+
+  TfLiteStatus allocate_status = interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk)
+  {
+    Serial.println("❌ Error al asignar tensors");
+    while (1)
+      ;
+  }
+  Serial.println("✅ Intérprete creado");
+
+  // 7. Verificar tensors
+  input = interpreter->input(0);
+  output = interpreter->output(0);
+
+  Serial.println("\n📐 Información del modelo:");
+  Serial.printf("   Input dims: %d\n", input->dims->size);
+  for (int i = 0; i < input->dims->size; i++)
+  {
+    Serial.printf("      [%d] = %d\n", i, input->dims->data[i]);
+  }
+
+  Serial.printf("   Output dims: %d\n", output->dims->size);
+  for (int i = 0; i < output->dims->size; i++)
+  {
+    Serial.printf("      [%d] = %d\n", i, output->dims->data[i]);
+  }
+
+  Serial.println("\n✅ FASE 1 COMPLETADA");
+  Serial.println("════════════════════════════════════");
+}
+
+void loop()
+{
+  delay(1000);
+}

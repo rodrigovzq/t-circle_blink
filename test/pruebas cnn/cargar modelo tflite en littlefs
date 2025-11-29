@@ -1,0 +1,150 @@
+#include <Arduino.h>
+#include <LittleFS.h>
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║  MoodLink - Verificación LittleFS     ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
+
+  // Montar filesystem
+  Serial.println("📂 Montando LittleFS...");
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("❌ Error: No se pudo montar LittleFS");
+    while (1)
+      delay(1000);
+  }
+  Serial.println("✅ LittleFS montado correctamente\n");
+
+  // Información del filesystem
+  Serial.println("💾 Información del filesystem:");
+  Serial.printf("   Total: %d bytes (%.2f MB)\n",
+                LittleFS.totalBytes(),
+                LittleFS.totalBytes() / 1024.0 / 1024.0);
+  Serial.printf("   Usado: %d bytes (%.2f MB)\n",
+                LittleFS.usedBytes(),
+                LittleFS.usedBytes() / 1024.0 / 1024.0);
+  Serial.printf("   Libre: %d bytes (%.2f MB)\n\n",
+                LittleFS.totalBytes() - LittleFS.usedBytes(),
+                (LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024.0 / 1024.0);
+
+  // Listar archivos
+  Serial.println("📋 Archivos en LittleFS:");
+  Serial.println("─────────────────────────────────────────");
+
+  File root = LittleFS.open("/");
+  if (!root)
+  {
+    Serial.println("❌ No se pudo abrir directorio raíz");
+    return;
+  }
+
+  if (!root.isDirectory())
+  {
+    Serial.println("❌ / no es un directorio");
+    return;
+  }
+
+  int fileCount = 0;
+  File file = root.openNextFile();
+  while (file)
+  {
+    fileCount++;
+
+    if (file.isDirectory())
+    {
+      Serial.printf("   📁 %-30s [DIR]\n", file.name());
+    }
+    else
+    {
+      Serial.printf("   📄 %-30s %8d bytes (%.2f KB)\n",
+                    file.name(),
+                    file.size(),
+                    file.size() / 1024.0);
+    }
+
+    file = root.openNextFile();
+  }
+
+  if (fileCount == 0)
+  {
+    Serial.println("   (vacío)");
+  }
+
+  Serial.println("─────────────────────────────────────────");
+  Serial.printf("Total de archivos: %d\n\n", fileCount);
+
+  // Verificar modelo específico
+  Serial.println("🔍 Verificando modelo ser_cnn.tflite...");
+
+  if (LittleFS.exists("/ser_cnn.tflite"))
+  {
+    File modelFile = LittleFS.open("/ser_cnn.tflite", "r");
+    if (modelFile)
+    {
+      Serial.println("✅ Modelo encontrado!");
+      Serial.printf("   Tamaño: %d bytes (%.2f KB)\n",
+                    modelFile.size(),
+                    modelFile.size() / 1024.0);
+
+      // Verificar que coincide con el tamaño esperado
+      if (modelFile.size() == 407784)
+      {
+        Serial.println("   ✅ Tamaño correcto (407,784 bytes)");
+      }
+      else
+      {
+        Serial.printf("   ⚠️  Tamaño diferente al esperado (esperado: 407,784)\n");
+      }
+
+      // Leer primeros bytes para verificar header TFLite
+      uint8_t header[4];
+      modelFile.read(header, 4);
+
+      Serial.print("   Header: ");
+      for (int i = 0; i < 4; i++)
+      {
+        Serial.printf("0x%02x ", header[i]);
+      }
+      Serial.println();
+
+      // Verificar magic number de TFLite (0x54, 0x46, 0x4c, 0x33 = "TFL3")
+      if (header[1] == 0x54 && header[2] == 0x46 &&
+          header[3] == 0x4c)
+      {
+        Serial.println("   ✅ Header TFLite válido!");
+      }
+      else
+      {
+        Serial.println("   ❌ Header no parece ser TFLite válido");
+      }
+
+      modelFile.close();
+    }
+    else
+    {
+      Serial.println("❌ No se pudo abrir el archivo");
+    }
+  }
+  else
+  {
+    Serial.println("❌ Modelo NO encontrado en /ser_cnn.tflite");
+    Serial.println("\n💡 Posibles soluciones:");
+    Serial.println("   1. Verificar que el archivo esté en carpeta data/");
+    Serial.println("   2. Ejecutar: pio run --target uploadfs");
+    Serial.println("   3. Verificar el nombre: debe ser exactamente 'ser_cnn.tflite'");
+  }
+
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║  Verificación completada               ║");
+  Serial.println("╚════════════════════════════════════════╝");
+}
+
+void loop()
+{
+  delay(1000);
+}
