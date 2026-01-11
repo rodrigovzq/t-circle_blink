@@ -4,6 +4,7 @@
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/system_setup.h"
 #include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "esp_task_wdt.h"
 
 // === CACHE MANAGEMENT para PSRAM ===
@@ -38,7 +39,7 @@ namespace
   TfLiteTensor *input = nullptr;
   TfLiteTensor *output = nullptr;
 
-  constexpr int kTensorArenaSize = 7 * 1024 * 1024; // 7 MB
+  constexpr int kTensorArenaSize = 1 * 1024 * 1024; // 1 MB (reducido de 7 MB)
   uint8_t *tensor_arena = nullptr;
   size_t actual_arena_size = 0;
 
@@ -63,6 +64,10 @@ void setup()
   Serial.begin(115200);
   delay(2000);
 
+  // Variables para medición de tiempos
+  unsigned long t_start, t_end;
+  unsigned long t_total_start = millis();
+
   Serial.println("\n🧠 MoodLink - Test TFLite Optimized Model");
   Serial.println("════════════════════════════════════════════════════════");
   Serial.printf("📌 VERSION: %s\n", VERSION);
@@ -79,25 +84,26 @@ void setup()
   // 1. Montar LittleFS
   // ═══════════════════════════════════════════════════════════
   Serial.println("\n📂 Montando LittleFS...");
+  t_start = millis();
   if (!LittleFS.begin(true))
   {
     Serial.println("❌ Error montando LittleFS");
-    while (1)
-      ;
+    while (1);
   }
-  Serial.println("✅ LittleFS OK");
+  t_end = millis();
+  Serial.printf("✅ LittleFS OK (%lu ms)\n", t_end - t_start);
 
   // ═══════════════════════════════════════════════════════════
   // 2. Cargar modelo
   // ═══════════════════════════════════════════════════════════
   Serial.println("\n📦 Cargando modelo...");
+  t_start = millis();
   File modelFile = LittleFS.open(MODEL_PATH, "r");
   if (!modelFile)
   {
     Serial.printf("❌ No se pudo abrir: %s\n", MODEL_PATH);
     Serial.println("   Verifica que el archivo existe en LittleFS");
-    while (1)
-      ;
+    while (1);
   }
 
   size_t modelSize = modelFile.size();
@@ -108,28 +114,29 @@ void setup()
   if (!modelBuffer)
   {
     Serial.println("❌ No hay PSRAM para modelo");
-    while (1)
-      ;
+    while (1);
   }
 
   modelFile.read(modelBuffer, modelSize);
   modelFile.close();
-  Serial.printf("✅ Modelo cargado: %s\n", getModelFileName(MODEL_PATH));
+  t_end = millis();
+  Serial.printf("✅ Modelo cargado: %s (%lu ms)\n", getModelFileName(MODEL_PATH), t_end - t_start);
 
   // ═══════════════════════════════════════════════════════════
   // 3. Inicializar TFLite
   // ═══════════════════════════════════════════════════════════
   Serial.println("\n🔧 Inicializando TFLite...");
+  t_start = millis();
 
   model = tflite::GetModel(modelBuffer);
   if (model->version() != TFLITE_SCHEMA_VERSION)
   {
     Serial.printf("❌ Versión incorrecta: modelo=%d, esperado=%d\n",
                   model->version(), TFLITE_SCHEMA_VERSION);
-    while (1)
-      ;
+    while (1);
   }
-  Serial.println("✅ Modelo compatible");
+  t_end = millis();
+  Serial.printf("✅ Modelo compatible (%lu ms)\n", t_end - t_start);
 
   // ═══════════════════════════════════════════════════════════
   // 4. Crear OpResolver con operadores del modelo optimizado
@@ -144,10 +151,12 @@ void setup()
   // - Quantize/Dequantize (INT8)
   // - Reshape, Add, Mul (para normalización)
 
-  static tflite::MicroMutableOpResolver<10> resolver;
+  t_start = millis();
+  static tflite::MicroMutableOpResolver<11> resolver;
   resolver.AddConv2D();
   resolver.AddMaxPool2D();
   resolver.AddAveragePool2D(); // Para GlobalAveragePooling2D
+  resolver.AddMean();          // CRÍTICO: Usado por GlobalAveragePooling2D
   resolver.AddFullyConnected();
   resolver.AddSoftmax();
   resolver.AddReshape();
@@ -155,73 +164,58 @@ void setup()
   resolver.AddDequantize();
   resolver.AddMul(); // Para BatchNorm
   resolver.AddAdd(); // Para BatchNorm
+  t_end = millis();
 
-  Serial.println("✅ OpResolver configurado (10 operadores)");
+  Serial.printf("✅ OpResolver configurado: 11 operadores (%lu ms)\n", t_end - t_start);
 
   // ═══════════════════════════════════════════════════════════
   // 5. Reservar tensor arena
   // ═══════════════════════════════════════════════════════════
   Serial.println("\n💾 Asignando tensor arena...");
+  t_start = millis();
 
-  // Intentar RAM interna primero (más rápida, sin cache issues)
-  constexpr int kReducedArenaSize = 512 * 1024; // 512 KB
-  tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kReducedArenaSize,
-                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  // Usar PSRAM directamente (ESP32-S3 con modelo pequeño)
+  tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM);
 
-  if (tensor_arena)
+  if (!tensor_arena)
   {
-    actual_arena_size = kReducedArenaSize;
-    Serial.printf("✅ Tensor arena en RAM INTERNA: %d KB\n", actual_arena_size / 1024);
-    Serial.println("   ℹ️  Modelo optimizado requiere menos memoria");
+    Serial.println("❌ No hay PSRAM disponible para tensor arena");
+    while (1);
   }
-  else
-  {
-    // Fallback a PSRAM con DMA capability
-    Serial.println("⚠️  RAM interna insuficiente, usando PSRAM...");
 
-    // Intento 1: PSRAM con DMA
-    tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize,
-                                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-
-    if (!tensor_arena)
-    {
-      // Intento 2: PSRAM normal
-      Serial.println("   ⚠️  DMA fallback, usando PSRAM estándar...");
-      tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM);
-    }
-
-    if (!tensor_arena)
-    {
-      Serial.println("❌ No hay memoria disponible para tensor arena");
-      while (1)
-        ;
-    }
-    actual_arena_size = kTensorArenaSize;
-    Serial.printf("✅ Tensor arena en PSRAM: %d KB\n", actual_arena_size / 1024);
-    Serial.println("   ⚠️  ADVERTENCIA: PSRAM con cache management experimental");
-  }
+  actual_arena_size = kTensorArenaSize;
+  t_end = millis();
+  Serial.printf("✅ Tensor arena asignada: %d KB en PSRAM (%lu ms)\n", actual_arena_size / 1024, t_end - t_start);
+  Serial.println("   ℹ️  Modelo optimizado (36 KB) con cache management");
 
   // ═══════════════════════════════════════════════════════════
   // 6. Crear error reporter e intérprete
   // ═══════════════════════════════════════════════════════════
-  // Error reporter como nullptr (librería Arduino requiere el parámetro)
-  error_reporter = nullptr;
+  t_start = millis();
+  // Crear error reporter dummy (la librería no acepta nullptr)
+  static tflite::MicroErrorReporter micro_error_reporter;
+  error_reporter = &micro_error_reporter;
 
   static tflite::MicroInterpreter static_interpreter(
       model, resolver, tensor_arena, actual_arena_size, error_reporter);
   interpreter = &static_interpreter;
+  t_end = millis();
+  unsigned long t_interpreter = t_end - t_start;
 
+  t_start = millis();
   TfLiteStatus allocate_status = interpreter->AllocateTensors();
+  t_end = millis();
+  unsigned long t_allocate = t_end - t_start;
+
   if (allocate_status != kTfLiteOk)
   {
     Serial.println("❌ Error al asignar tensors");
     Serial.println("   Posibles causas:");
     Serial.println("   - Arena muy pequeña para el modelo");
     Serial.println("   - Operadores faltantes en OpResolver");
-    while (1)
-      ;
+    while (1);
   }
-  Serial.println("✅ Intérprete creado y tensors asignados");
+  Serial.printf("✅ Intérprete creado (%lu ms) + tensors asignados (%lu ms)\n", t_interpreter, t_allocate);
 
   // ═══════════════════════════════════════════════════════════
   // 7. Obtener tensors y validar dimensiones
@@ -268,7 +262,9 @@ void setup()
     Serial.println("\n✅ Dimensiones del modelo correctas");
   }
 
+  unsigned long t_fase1 = millis() - t_total_start;
   Serial.println("\n✅ FASE 1 COMPLETADA");
+  Serial.printf("⏱️  Tiempo total FASE 1: %lu ms\n", t_fase1);
   Serial.println("════════════════════════════════════════════════════════");
 
   delay(2000);
@@ -288,12 +284,14 @@ void setup()
   Serial.printf("   Tamaño: %d MFCCs x %d frames = %d valores\n",
                 input->dims->data[1], input->dims->data[2], input_size);
 
+  t_start = millis();
   // Modelo int8: usar valores en rango [-128, 127]
   for (int i = 0; i < input_size; i++)
   {
     input->data.int8[i] = random(-128, 128);
   }
-  Serial.println("✅ Input tensor llenado con datos random");
+  t_end = millis();
+  Serial.printf("✅ Input tensor llenado con datos random (%lu ms)\n", t_end - t_start);
 
   // 9. Ejecutar inferencia
   Serial.println("\n🧠 Ejecutando inferencia...");
@@ -403,10 +401,24 @@ void setup()
   Serial.println("   Para inferencia real, reemplaza el input con MFCCs");
   Serial.println("   de un audio procesado (40 MFCCs x 100 frames).");
 
+  unsigned long t_total = millis() - t_total_start;
+
   Serial.println("\n✅ FASE 2 COMPLETADA");
   Serial.println("════════════════════════════════════════════════════════");
   Serial.println("\n🎉 Test finalizado exitosamente!");
   Serial.printf("📦 Modelo probado: %s\n", getModelFileName(MODEL_PATH));
+  Serial.println("════════════════════════════════════════════════════════");
+
+  // Resumen de tiempos
+  Serial.println("\n⏱️  RESUMEN DE TIEMPOS DEL PIPELINE:");
+  Serial.println("════════════════════════════════════════════════════════");
+  Serial.println("FASE 1 - Inicialización:");
+  Serial.println("   [Ver tiempos individuales arriba]");
+  Serial.printf("   Subtotal FASE 1: %lu ms\n\n", t_fase1);
+  Serial.println("FASE 2 - Inferencia:");
+  Serial.printf("   • Inferencia (Invoke): %lu ms\n", elapsed);
+  Serial.printf("   Subtotal FASE 2: ~%lu ms\n\n", elapsed + 200); // Aproximado con overhead
+  Serial.printf("⏱️  TIEMPO TOTAL: %lu ms (%.2f seg)\n", t_total, t_total / 1000.0);
   Serial.println("════════════════════════════════════════════════════════");
 }
 
