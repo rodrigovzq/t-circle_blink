@@ -1,630 +1,428 @@
 #include <Arduino.h>
 #include <LittleFS.h>
-#include "FastLED.h"
-#include "pin_config.h"
-#include "Arduino_DriveBus_Library.h"
-#include "arduinoFFT.h"
-#include "Arduino_GFX_Library.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/system_setup.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "esp_task_wdt.h"
 
-// VERSION DE PRUEBA
-#define VERSION "v1.0-test4"
+// === CACHE MANAGEMENT para PSRAM ===
+#include "esp_heap_caps.h"
 
-#define DATA_PIN APA102_DATA
-#define CLOCK_PIN APA102_CLOCK
-#define BUTTON_PIN 0
-
-// Parámetros del modelo
-#define SAMPLE_RATE 44100
-#define DURATION_SEC 4
-#define N_SAMPLES (SAMPLE_RATE * DURATION_SEC)
-#define N_MFCC 128
-#define N_FFT 2048
-#define HOP_LENGTH 512
-#define N_FRAMES 345
-#define N_MELS 128
-
-// Normalización
-#define MFCC_MEAN -3.419721f
-#define MFCC_STD 51.893776f
-
-// Colores para la pantalla (RGB565)
-#define COLOR_BG 0x0000      // Negro
-#define COLOR_PRIMARY 0x07FF // Cyan
-#define COLOR_SUCCESS 0x07E0 // Verde
-#define COLOR_WARNING 0xFFE0 // Amarillo
-#define COLOR_ERROR 0xF800   // Rojo
-#define COLOR_TEXT 0xFFFF    // Blanco
-#define COLOR_GRAY 0x8410    // Gris
-
-CRGB leds[1];
-
-std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
-    std::make_shared<Arduino_HWIIS>(I2S_NUM_0, MSM261_BCLK, MSM261_WS, MSM261_DATA);
-std::unique_ptr<Arduino_IIS> Microphone(new Arduino_MEMS(IIS_Bus));
-
-// Display
-Arduino_DataBus *bus = nullptr;
-Arduino_GFX *gfx = nullptr;
-
-// Buffers
-int16_t *audioBuffer = nullptr;
-float *mfccOutput = nullptr;
-size_t writeIndex = 0;
-bool recording = false;
-
-// FFT
-ArduinoFFT<float> FFT;
-float *vReal = nullptr;
-float *vImag = nullptr;
-
-// Mel filterbank y DCT
-float *melFilterbank = nullptr;
-float *dctMatrix = nullptr;
-float *hammingWindow = nullptr;
-
-// Métricas
-unsigned long timeCapture = 0;
-unsigned long timeMFCC = 0;
-unsigned long timeTotal = 0;
-
-// ============================================
-// UI: Pantalla de inicio
-// ============================================
-void showStartScreen()
+// Declaraciones de funciones ROM de caché (ESP32-S3)
+extern "C"
 {
-  gfx->fillScreen(COLOR_BG);
-
-  // Título (centrado)
-  gfx->setTextColor(COLOR_PRIMARY);
-  gfx->setTextSize(2);
-  gfx->setCursor(32, 40);
-  gfx->println("MoodLink");
-
-  // Versión (centrado)
-  gfx->setTextColor(COLOR_GRAY);
-  gfx->setTextSize(1);
-  gfx->setCursor(45, 65);
-  gfx->println("Test MFCC");
-
-  // Instrucción (centrado)
-  gfx->setTextColor(COLOR_TEXT);
-  gfx->setTextSize(1);
-  gfx->setCursor(28, 100);
-  gfx->println("Presiona BTN");
-  gfx->setCursor(28, 115);
-  gfx->println("para grabar");
-
-  // Indicador de estado (centrado)
-  // gfx->fillCircle(80, 140, 5, COLOR_SUCCESS);
-  gfx->setTextColor(COLOR_SUCCESS);
-  gfx->setCursor(65, 136);
-  gfx->println("Listo");
+  void Cache_WriteBack_All(void);
 }
 
-// ============================================
-// UI: Pantalla de grabación
-// ============================================
-void showRecordingScreen(float progress)
+#define VERSION "v3.0-optimized-model"
+
+// ═══════════════════════════════════════════════════════════
+// CONFIGURACIÓN DEL MODELO
+// ═══════════════════════════════════════════════════════════
+const char *MODEL_PATH = "/ser_202601_optimized_int8.tflite";
+
+// Parámetros del modelo optimizado (40 MFCCs x 100 frames)
+constexpr int EXPECTED_INPUT_HEIGHT = 40;  // MFCCs
+constexpr int EXPECTED_INPUT_WIDTH = 100;  // Time frames
+constexpr int EXPECTED_INPUT_CHANNELS = 1; // Mono
+constexpr int EXPECTED_NUM_EMOTIONS = 7;   // 7 emociones normalizadas
+
+// ═══════════════════════════════════════════════════════════
+// TFLite globals
+// ═══════════════════════════════════════════════════════════
+namespace
 {
-  gfx->fillScreen(COLOR_BG);
+  const tflite::Model *model = nullptr;
+  tflite::MicroInterpreter *interpreter = nullptr;
+  TfLiteTensor *input = nullptr;
+  TfLiteTensor *output = nullptr;
 
-  // Título (centrado)
-  gfx->setTextColor(COLOR_ERROR);
-  gfx->setTextSize(2);
-  gfx->setCursor(32, 30);
-  gfx->println("GRABANDO");
+  constexpr int kTensorArenaSize = 1 * 1024 * 1024; // 1 MB (reducido de 7 MB)
+  uint8_t *tensor_arena = nullptr;
+  size_t actual_arena_size = 0;
 
-  // Tiempo transcurrido (centrado)
-  gfx->setTextColor(COLOR_TEXT);
-  gfx->setTextSize(1);
-  int elapsed = (int)(progress * DURATION_SEC);
-  gfx->setCursor(34, 60);
-  gfx->printf("%d.0s / 4.0s", elapsed);
-
-  // Barra de progreso circular
-  int centerX = 80;
-  int centerY = 100;
-  int radius = 35;
-
-  // Fondo del círculo
-  gfx->drawCircle(centerX, centerY, radius, COLOR_GRAY);
-
-  // Arco de progreso
-  int angle = (int)(progress * 360);
-  for (int i = 0; i < angle; i++)
-  {
-    float rad = (i - 90) * PI / 180.0;
-    int x1 = centerX + (radius - 3) * cos(rad);
-    int y1 = centerY + (radius - 3) * sin(rad);
-    int x2 = centerX + radius * cos(rad);
-    int y2 = centerY + radius * sin(rad);
-    gfx->drawLine(x1, y1, x2, y2, COLOR_ERROR);
-  }
-
-  // Porcentaje en el centro
-  gfx->setTextSize(2);
-  gfx->setTextColor(COLOR_TEXT);
-  gfx->setCursor(centerX - 20, centerY - 10);
-  gfx->printf("%d%%", (int)(progress * 100));
+  tflite::ErrorReporter *error_reporter = nullptr;
 }
 
-// ============================================
-// UI: Pantalla de procesamiento
-// ============================================
-void showProcessingScreen(int currentFrame, int totalFrames)
+// Nombres de emociones (7 emociones normalizadas)
+const char *emotion_labels[] = {
+    "anger", "disgust", "fear", "happy", "neutral", "sad", "surprise"};
+
+// ═══════════════════════════════════════════════════════════
+// FUNCIÓN AUXILIAR: Extraer nombre del archivo
+// ═══════════════════════════════════════════════════════════
+const char *getModelFileName(const char *path)
 {
-  static unsigned long lastUpdate = 0;
-
-  // Actualizar solo cada 100ms para no saturar
-  if (millis() - lastUpdate < 100)
-    return;
-  lastUpdate = millis();
-
-  gfx->fillScreen(COLOR_BG);
-
-  // Título (centrado)
-  gfx->setTextColor(COLOR_WARNING);
-  gfx->setTextSize(2);
-  gfx->setCursor(20, 30);
-  gfx->println("Procesando");
-
-  // Progreso (centrado)
-  float progress = (float)currentFrame / totalFrames;
-  gfx->setTextColor(COLOR_TEXT);
-  gfx->setTextSize(1);
-  gfx->setCursor(22, 60);
-  gfx->printf("Frame %d/%d", currentFrame, totalFrames);
-
-  // Barra horizontal (centrada)
-  int barX = 20;
-  int barY = 85;
-  int barW = 120;
-  int barH = 15;
-
-  gfx->drawRect(barX, barY, barW, barH, COLOR_GRAY);
-  gfx->fillRect(barX + 2, barY + 2, (int)((barW - 4) * progress), barH - 4, COLOR_WARNING);
-
-  // Porcentaje (centrado)
-  gfx->setTextSize(2);
-  gfx->setCursor(60, 110);
-  gfx->printf("%d%%", (int)(progress * 100));
-
-  // Spinner animado (centrado)
-  static int spinnerAngle = 0;
-  spinnerAngle = (spinnerAngle + 30) % 360;
-  int cx = 80, cy = 140, r = 8;
-  float rad = spinnerAngle * PI / 180.0;
-  gfx->drawLine(cx, cy, cx + r * cos(rad), cy + r * sin(rad), COLOR_WARNING);
+  const char *lastSlash = strrchr(path, '/');
+  return (lastSlash != nullptr) ? (lastSlash + 1) : path;
 }
 
-// ============================================
-// UI: Pantalla de resultados
-// ============================================
-void showResultsScreen()
-{
-  gfx->fillScreen(COLOR_BG);
-
-  // Título (centrado)
-  gfx->setTextColor(COLOR_SUCCESS);
-  gfx->setTextSize(2);
-  gfx->setCursor(32, 20);
-  gfx->println("Completo");
-
-  // Métricas (centradas)
-  gfx->setTextColor(COLOR_TEXT);
-  gfx->setTextSize(1);
-
-  gfx->setCursor(20, 50);
-  gfx->printf("Captura: %lums", timeCapture);
-
-  gfx->setCursor(20, 65);
-  gfx->printf("MFCCs:   %lums", timeMFCC);
-
-  gfx->setCursor(20, 80);
-  gfx->printf("Total:   %lums", timeTotal);
-
-  // Línea separadora (centrada)
-  gfx->drawLine(20, 95, 140, 95, COLOR_GRAY);
-
-  // Primer MFCC (centrado)
-  gfx->setCursor(28, 105);
-  gfx->println("MFCC[0][0]:");
-  gfx->setTextSize(2);
-  gfx->setTextColor(COLOR_PRIMARY);
-  gfx->setCursor(40, 120);
-  gfx->printf("%.2f", mfccOutput[0]);
-
-  // Indicador de éxito (centrado)
-  gfx->fillCircle(80, 148, 4, COLOR_SUCCESS);
-}
-
-// ============================================
-// Inicialización de Hamming Window
-// ============================================
-void initHammingWindow()
-{
-  for (int i = 0; i < N_FFT; i++)
-  {
-    hammingWindow[i] = 0.54f - 0.46f * cos(2.0f * PI * i / (N_FFT - 1));
-  }
-  Serial.println("✅ Hamming window inicializada");
-}
-
-// ============================================
-// Inicialización de Mel Filterbank
-// ============================================
-void initMelFilterbank()
-{
-  auto hzToMel = [](float hz)
-  { return 2595.0f * log10(1.0f + hz / 700.0f); };
-  auto melToHz = [](float mel)
-  { return 700.0f * (pow(10.0f, mel / 2595.0f) - 1.0f); };
-
-  float melMin = hzToMel(0);
-  float melMax = hzToMel(SAMPLE_RATE / 2.0f);
-
-  float melPoints[N_MELS + 2];
-  for (int i = 0; i < N_MELS + 2; i++)
-  {
-    melPoints[i] = melMin + (melMax - melMin) * i / (N_MELS + 1);
-  }
-
-  int bins[N_MELS + 2];
-  for (int i = 0; i < N_MELS + 2; i++)
-  {
-    float hz = melToHz(melPoints[i]);
-    bins[i] = (int)floor((N_FFT + 1) * hz / SAMPLE_RATE);
-  }
-
-  memset(melFilterbank, 0, N_MELS * (N_FFT / 2 + 1) * sizeof(float));
-
-  for (int m = 0; m < N_MELS; m++)
-  {
-    int leftBin = bins[m];
-    int centerBin = bins[m + 1];
-    int rightBin = bins[m + 2];
-
-    for (int k = leftBin; k < centerBin; k++)
-    {
-      melFilterbank[m * (N_FFT / 2 + 1) + k] =
-          (float)(k - leftBin) / (centerBin - leftBin);
-    }
-
-    for (int k = centerBin; k < rightBin; k++)
-    {
-      melFilterbank[m * (N_FFT / 2 + 1) + k] =
-          (float)(rightBin - k) / (rightBin - centerBin);
-    }
-  }
-
-  Serial.println("✅ Mel filterbank inicializada");
-}
-
-// ============================================
-// Inicialización de DCT Matrix
-// ============================================
-void initDCTMatrix()
-{
-  for (int i = 0; i < N_MFCC; i++)
-  {
-    for (int j = 0; j < N_MELS; j++)
-    {
-      dctMatrix[i * N_MELS + j] =
-          cos(PI * i * (j + 0.5f) / N_MELS) * sqrt(2.0f / N_MELS);
-    }
-  }
-  Serial.println("✅ DCT matrix inicializada");
-}
-
-// ============================================
-// Extraer MFCCs de un frame
-// ============================================
-void extractFrameMFCC(int frameIndex, float *mfccs)
-{
-  int offset = frameIndex * HOP_LENGTH;
-
-  for (int i = 0; i < N_FFT; i++)
-  {
-    if (offset + i < N_SAMPLES)
-    {
-      vReal[i] = audioBuffer[offset + i] * hammingWindow[i];
-    }
-    else
-    {
-      vReal[i] = 0;
-    }
-    vImag[i] = 0;
-  }
-
-  FFT.compute(vReal, vImag, N_FFT, FFTDirection::Forward);
-
-  float magnitude[N_FFT / 2 + 1];
-  for (int i = 0; i < N_FFT / 2 + 1; i++)
-  {
-    magnitude[i] = sqrt(vReal[i] * vReal[i] + vImag[i] * vImag[i]);
-  }
-
-  float melEnergies[N_MELS];
-  for (int m = 0; m < N_MELS; m++)
-  {
-    float energy = 0.0f;
-    for (int k = 0; k < N_FFT / 2 + 1; k++)
-    {
-      energy += magnitude[k] * melFilterbank[m * (N_FFT / 2 + 1) + k];
-    }
-    melEnergies[m] = log(energy + 1e-10f);
-  }
-
-  for (int i = 0; i < N_MFCC; i++)
-  {
-    float sum = 0.0f;
-    for (int j = 0; j < N_MELS; j++)
-    {
-      sum += melEnergies[j] * dctMatrix[i * N_MELS + j];
-    }
-    mfccs[i] = sum;
-  }
-}
-
-// ============================================
-// Procesar todo el audio a MFCCs
-// ============================================
-void processAudioToMFCC()
-{
-  Serial.println("\n🔄 Procesando audio a MFCCs...");
-
-  unsigned long startMFCC = millis();
-
-  float frameMFCCs[N_MFCC];
-
-  for (int frame = 0; frame < N_FRAMES; frame++)
-  {
-    extractFrameMFCC(frame, frameMFCCs);
-
-    for (int i = 0; i < N_MFCC; i++)
-    {
-      mfccOutput[i * N_FRAMES + frame] = (frameMFCCs[i] - MFCC_MEAN) / MFCC_STD;
-    }
-
-    // Actualizar UI cada 10 frames
-    if (frame % 10 == 0)
-    {
-      showProcessingScreen(frame, N_FRAMES);
-    }
-
-    if (frame % 50 == 0)
-    {
-      Serial.printf("   Frame %d/%d (%.1f%%)\n", frame, N_FRAMES, frame * 100.0f / N_FRAMES);
-    }
-  }
-
-  timeMFCC = millis() - startMFCC;
-  Serial.printf("✅ MFCCs extraídos en %lu ms\n", timeMFCC);
-}
-
-// ============================================
-// Mostrar métricas en Serial
-// ============================================
-void printMetrics()
-{
-  Serial.println("\n📊 ═══════════════════════════════════════");
-  Serial.println("   MÉTRICAS DE PROCESAMIENTO");
-  Serial.println("   ═══════════════════════════════════════");
-  Serial.printf("   🎤 Captura de audio:      %5lu ms\n", timeCapture);
-  Serial.printf("   🔊 Extracción MFCCs:      %5lu ms\n", timeMFCC);
-  Serial.println("   ───────────────────────────────────────");
-  Serial.printf("   ⏱️  TOTAL:                 %5lu ms\n", timeTotal);
-  Serial.printf("   📈 Desglose porcentual:\n");
-  Serial.printf("   Captura:   %.1f%%\n", (timeCapture * 100.0f) / timeTotal);
-  Serial.printf("   MFCCs:     %.1f%%\n", (timeMFCC * 100.0f) / timeTotal);
-  Serial.printf("   💾 PSRAM libre:     %d KB\n",
-                heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
-  Serial.printf("   📐 Primeros 5 MFCCs del frame 0:\n");
-  for (int i = 0; i < 5; i++)
-  {
-    Serial.printf("      [%d][0] = %.4f\n", i, mfccOutput[i * N_FRAMES]);
-  }
-  Serial.println("   ═══════════════════════════════════════\n");
-}
-
-// ============================================
-// Setup
-// ============================================
 void setup()
 {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n🎙️  MoodLink - Test MFCC + UI");
-  Serial.println("═══════════════════════════════════════");
-  Serial.print("📌 VERSION: ");
-  Serial.println(VERSION);
-  Serial.println("═══════════════════════════════════════");
+  delay(2000);
 
+  // Variables para medición de tiempos
+  unsigned long t_start, t_end;
+  unsigned long t_total_start = millis();
+
+  Serial.println("\n🧠 MoodLink - Test TFLite Optimized Model");
+  Serial.println("════════════════════════════════════════════════════════");
+  Serial.printf("📌 VERSION: %s\n", VERSION);
+  Serial.printf("📦 MODELO: %s\n", getModelFileName(MODEL_PATH));
+  Serial.println("════════════════════════════════════════════════════════");
+
+  Serial.printf("\n📐 Configuración esperada:\n");
+  Serial.printf("   Input: [1, %d, %d, %d] (batch, MFCCs, frames, channels)\n",
+                EXPECTED_INPUT_HEIGHT, EXPECTED_INPUT_WIDTH, EXPECTED_INPUT_CHANNELS);
+  Serial.printf("   Output: [1, %d] (batch, emociones)\n", EXPECTED_NUM_EMOTIONS);
+  Serial.println("════════════════════════════════════════════════════════");
+
+  // ═══════════════════════════════════════════════════════════
+  // 1. Montar LittleFS
+  // ═══════════════════════════════════════════════════════════
+  Serial.println("\n📂 Montando LittleFS...");
+  t_start = millis();
   if (!LittleFS.begin(true))
   {
-    Serial.println("❌ No se pudo montar LittleFS");
+    Serial.println("❌ Error montando LittleFS");
+    while (1);
+  }
+  t_end = millis();
+  Serial.printf("✅ LittleFS OK (%lu ms)\n", t_end - t_start);
+
+  // ═══════════════════════════════════════════════════════════
+  // 2. Cargar modelo
+  // ═══════════════════════════════════════════════════════════
+  Serial.println("\n📦 Cargando modelo...");
+  t_start = millis();
+  File modelFile = LittleFS.open(MODEL_PATH, "r");
+  if (!modelFile)
+  {
+    Serial.printf("❌ No se pudo abrir: %s\n", MODEL_PATH);
+    Serial.println("   Verifica que el archivo existe en LittleFS");
+    while (1);
+  }
+
+  size_t modelSize = modelFile.size();
+  Serial.printf("   Archivo: %s\n", getModelFileName(MODEL_PATH));
+  Serial.printf("   Tamaño: %d bytes (%.2f KB)\n", modelSize, modelSize / 1024.0);
+
+  uint8_t *modelBuffer = (uint8_t *)ps_malloc(modelSize);
+  if (!modelBuffer)
+  {
+    Serial.println("❌ No hay PSRAM para modelo");
+    while (1);
+  }
+
+  modelFile.read(modelBuffer, modelSize);
+  modelFile.close();
+  t_end = millis();
+  Serial.printf("✅ Modelo cargado: %s (%lu ms)\n", getModelFileName(MODEL_PATH), t_end - t_start);
+
+  // ═══════════════════════════════════════════════════════════
+  // 3. Inicializar TFLite
+  // ═══════════════════════════════════════════════════════════
+  Serial.println("\n🔧 Inicializando TFLite...");
+  t_start = millis();
+
+  model = tflite::GetModel(modelBuffer);
+  if (model->version() != TFLITE_SCHEMA_VERSION)
+  {
+    Serial.printf("❌ Versión incorrecta: modelo=%d, esperado=%d\n",
+                  model->version(), TFLITE_SCHEMA_VERSION);
+    while (1);
+  }
+  t_end = millis();
+  Serial.printf("✅ Modelo compatible (%lu ms)\n", t_end - t_start);
+
+  // ═══════════════════════════════════════════════════════════
+  // 4. Crear OpResolver con operadores del modelo optimizado
+  // ═══════════════════════════════════════════════════════════
+  // Modelo optimizado usa:
+  // - Conv2D (3 capas)
+  // - MaxPool2D (3 capas)
+  // - GlobalAveragePooling2D → AveragePool2D en TFLite
+  // - BatchNormalization (fusionado en Conv2D generalmente)
+  // - Dense (2 capas) → FullyConnected
+  // - Softmax (salida)
+  // - Quantize/Dequantize (INT8)
+  // - Reshape, Add, Mul (para normalización)
+
+  t_start = millis();
+  static tflite::MicroMutableOpResolver<11> resolver;
+  resolver.AddConv2D();
+  resolver.AddMaxPool2D();
+  resolver.AddAveragePool2D(); // Para GlobalAveragePooling2D
+  resolver.AddMean();          // CRÍTICO: Usado por GlobalAveragePooling2D
+  resolver.AddFullyConnected();
+  resolver.AddSoftmax();
+  resolver.AddReshape();
+  resolver.AddQuantize();
+  resolver.AddDequantize();
+  resolver.AddMul(); // Para BatchNorm
+  resolver.AddAdd(); // Para BatchNorm
+  t_end = millis();
+
+  Serial.printf("✅ OpResolver configurado: 11 operadores (%lu ms)\n", t_end - t_start);
+
+  // ═══════════════════════════════════════════════════════════
+  // 5. Reservar tensor arena
+  // ═══════════════════════════════════════════════════════════
+  Serial.println("\n💾 Asignando tensor arena...");
+  t_start = millis();
+
+  // Usar PSRAM directamente (ESP32-S3 con modelo pequeño)
+  tensor_arena = (uint8_t *)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM);
+
+  if (!tensor_arena)
+  {
+    Serial.println("❌ No hay PSRAM disponible para tensor arena");
+    while (1);
+  }
+
+  actual_arena_size = kTensorArenaSize;
+  t_end = millis();
+  Serial.printf("✅ Tensor arena asignada: %d KB en PSRAM (%lu ms)\n", actual_arena_size / 1024, t_end - t_start);
+  Serial.println("   ℹ️  Modelo optimizado (36 KB) con cache management");
+
+  // ═══════════════════════════════════════════════════════════
+  // 6. Crear error reporter e intérprete
+  // ═══════════════════════════════════════════════════════════
+  t_start = millis();
+  // Crear error reporter dummy (la librería no acepta nullptr)
+  static tflite::MicroErrorReporter micro_error_reporter;
+  error_reporter = &micro_error_reporter;
+
+  static tflite::MicroInterpreter static_interpreter(
+      model, resolver, tensor_arena, actual_arena_size, error_reporter);
+  interpreter = &static_interpreter;
+  t_end = millis();
+  unsigned long t_interpreter = t_end - t_start;
+
+  t_start = millis();
+  TfLiteStatus allocate_status = interpreter->AllocateTensors();
+  t_end = millis();
+  unsigned long t_allocate = t_end - t_start;
+
+  if (allocate_status != kTfLiteOk)
+  {
+    Serial.println("❌ Error al asignar tensors");
+    Serial.println("   Posibles causas:");
+    Serial.println("   - Arena muy pequeña para el modelo");
+    Serial.println("   - Operadores faltantes en OpResolver");
+    while (1);
+  }
+  Serial.printf("✅ Intérprete creado (%lu ms) + tensors asignados (%lu ms)\n", t_interpreter, t_allocate);
+
+  // ═══════════════════════════════════════════════════════════
+  // 7. Obtener tensors y validar dimensiones
+  // ═══════════════════════════════════════════════════════════
+  input = interpreter->input(0);
+  output = interpreter->output(0);
+
+  Serial.println("\n📐 Información del modelo:");
+  Serial.printf("   Input shape: [%d, %d, %d, %d]\n",
+                input->dims->data[0], input->dims->data[1],
+                input->dims->data[2], input->dims->data[3]);
+  Serial.printf("   Input type: %s\n",
+                input->type == kTfLiteInt8 ? "INT8" : "FLOAT32");
+  Serial.printf("   Output shape: [%d, %d]\n",
+                output->dims->data[0], output->dims->data[1]);
+  Serial.printf("   Output type: %s\n",
+                output->type == kTfLiteInt8 ? "INT8" : "FLOAT32");
+
+  // Validar dimensiones esperadas
+  bool dims_ok = true;
+  if (input->dims->data[1] != EXPECTED_INPUT_HEIGHT ||
+      input->dims->data[2] != EXPECTED_INPUT_WIDTH ||
+      input->dims->data[3] != EXPECTED_INPUT_CHANNELS)
+  {
+    Serial.println("\n⚠️  ADVERTENCIA: Dimensiones de entrada no coinciden!");
+    Serial.printf("   Esperado: [1, %d, %d, %d]\n",
+                  EXPECTED_INPUT_HEIGHT, EXPECTED_INPUT_WIDTH, EXPECTED_INPUT_CHANNELS);
+    Serial.printf("   Obtenido: [%d, %d, %d, %d]\n",
+                  input->dims->data[0], input->dims->data[1],
+                  input->dims->data[2], input->dims->data[3]);
+    dims_ok = false;
+  }
+
+  if (output->dims->data[1] != EXPECTED_NUM_EMOTIONS)
+  {
+    Serial.println("\n⚠️  ADVERTENCIA: Número de emociones no coincide!");
+    Serial.printf("   Esperado: %d emociones\n", EXPECTED_NUM_EMOTIONS);
+    Serial.printf("   Obtenido: %d emociones\n", output->dims->data[1]);
+    dims_ok = false;
+  }
+
+  if (dims_ok)
+  {
+    Serial.println("\n✅ Dimensiones del modelo correctas");
+  }
+
+  unsigned long t_fase1 = millis() - t_total_start;
+  Serial.println("\n✅ FASE 1 COMPLETADA");
+  Serial.printf("⏱️  Tiempo total FASE 1: %lu ms\n", t_fase1);
+  Serial.println("════════════════════════════════════════════════════════");
+
+  delay(2000);
+
+  // ═══════════════════════════════════════════════════════════
+  // FASE 2: INFERENCIA DUMMY
+  // ═══════════════════════════════════════════════════════════
+
+  Serial.println("\n🎲 FASE 2: Inferencia con datos aleatorios");
+  Serial.println("════════════════════════════════════════════════════════");
+
+  // 8. Llenar input con datos aleatorios
+  Serial.println("\n🎲 Generando datos de entrada aleatorios...");
+
+  int input_size = input->dims->data[1] * input->dims->data[2] * input->dims->data[3];
+  Serial.printf("   Total elementos input: %d\n", input_size);
+  Serial.printf("   Tamaño: %d MFCCs x %d frames = %d valores\n",
+                input->dims->data[1], input->dims->data[2], input_size);
+
+  t_start = millis();
+  // Modelo int8: usar valores en rango [-128, 127]
+  for (int i = 0; i < input_size; i++)
+  {
+    input->data.int8[i] = random(-128, 128);
+  }
+  t_end = millis();
+  Serial.printf("✅ Input tensor llenado con datos random (%lu ms)\n", t_end - t_start);
+
+  // 9. Ejecutar inferencia
+  Serial.println("\n🧠 Ejecutando inferencia...");
+
+  // Test de acceso a memoria
+  Serial.println("\n🔍 DEBUG: Validando acceso a tensor_arena...");
+  volatile uint8_t test_val = tensor_arena[0];
+  tensor_arena[0] = 0xAA;
+  if (tensor_arena[0] != 0xAA)
+  {
+    Serial.println("❌ ERROR: Memory write/read failed!");
+    while (1)
+      ;
+  }
+  tensor_arena[0] = test_val;
+  Serial.println("✅ Tensor arena accesible");
+
+  // Estado de memoria antes de Invoke()
+  Serial.println("\n📊 Estado de memoria PRE-INVOKE:");
+  Serial.printf("   Free heap: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("   Free PSRAM: %d bytes\n", ESP.getFreePsram());
+  Serial.printf("   Largest free block: %d bytes\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  Serial.flush();
+
+  // Desactivar watchdog durante inferencia
+  esp_task_wdt_init(60, false); // 60 segundos sin watchdog
+
+  // CACHE MANAGEMENT para PSRAM
+  if (actual_arena_size == kTensorArenaSize) // Solo si usamos PSRAM
+  {
+    Serial.println("\n🔄 Sincronizando caché con PSRAM...");
+    Cache_WriteBack_All();
+    Serial.println("   ✅ Cache writeback completado");
+    delay(100);
+  }
+
+  Serial.println("\n⏱️  Iniciando Invoke()...");
+  Serial.flush();
+
+  unsigned long start = millis();
+  TfLiteStatus invoke_status = interpreter->Invoke();
+  unsigned long elapsed = millis() - start;
+
+  Serial.println("✅ Invoke() COMPLETADO!");
+  Serial.flush();
+
+  esp_task_wdt_init(5, true); // 5 segundos normal
+
+  // Estado de memoria después de Invoke()
+  Serial.println("\n📊 Estado de memoria POST-INVOKE:");
+  Serial.printf("   Free heap: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("   Free PSRAM: %d bytes\n", ESP.getFreePsram());
+  Serial.flush();
+
+  if (invoke_status != kTfLiteOk)
+  {
+    Serial.println("❌ Error durante la inferencia");
     while (1)
       ;
   }
 
-  // Inicializar LED
-  FastLED.addLeds<APA102, DATA_PIN, CLOCK_PIN, BGR>(leds, 1);
-  FastLED.setBrightness(50);
-  leds[0] = CRGB::Blue;
-  FastLED.show();
+  Serial.printf("✅ Inferencia completada en %lu ms\n", elapsed);
 
-  // Inicializar pantalla
-  Serial.println("🖥️  Inicializando pantalla...");
-  Serial.printf("   LCD_DC: %d, LCD_CS: %d, LCD_SCLK: %d, LCD_MOSI: %d\n",
-                LCD_DC, LCD_CS, LCD_SCLK, LCD_MOSI);
-  Serial.printf("   LCD_RST: %d, LCD_BL: %d\n", LCD_RST, LCD_BL);
+  // 10. Leer resultados
+  Serial.println("\n📊 Resultados (probabilidades):");
+  Serial.println("════════════════════════════════════════════════════════");
 
-  // Configurar backlight con PWM al 50% de brillo
-  // NOTA: El PWM está invertido (0=máximo, 255=apagado)
-  pinMode(LCD_BL, OUTPUT);
-  digitalWrite(LCD_BL, HIGH);
-  ledcAttachPin(LCD_BL, 1);
-  ledcSetup(1, 2000, 8);
-  ledcWrite(1, 127); // Invertido: 127 = 50% brillo (255-128=127)
-  Serial.println("   ✓ Backlight configurado con PWM (50%)");
+  // Output es int8, necesitamos dequantizar
+  float scale = output->params.scale;
+  int zero_point = output->params.zero_point;
 
-  // Usar Arduino_ESP32SPIDMA (con DMA) igual que ejemplos oficiales
-  bus = new Arduino_ESP32SPIDMA(
-      LCD_DC,
-      LCD_CS,
-      LCD_SCLK,
-      LCD_MOSI,
-      GFX_NOT_DEFINED);
-  Serial.println("   ✓ Bus SPI DMA creado");
+  Serial.printf("   Output quantization: scale=%.6f, zero_point=%d\n\n",
+                scale, zero_point);
 
-  // Configurar GC9D01N igual que ejemplos oficiales
-  gfx = new Arduino_GC9D01N(
-      bus,
-      LCD_RST,
-      0,     // rotation
-      false, // IPS (false como en ejemplos oficiales)
-      LCD_WIDTH,
-      LCD_HEIGHT,
-      0, 0, 0, 0); // offsets
-  Serial.println("   ✓ Driver GC9D01N creado");
+  int max_idx = 0;
+  float max_prob = -1000.0f;
 
-  gfx->begin();
-  Serial.println("   ✓ Display inicializado");
-
-  gfx->fillScreen(WHITE);
-  Serial.println("   ✓ Pantalla rellenada con BLANCO");
-  delay(200);
-
-  gfx->fillScreen(RED);
-  Serial.println("   ✓ Pantalla rellenada con ROJO");
-  delay(200);
-
-  gfx->fillScreen(GREEN);
-  Serial.println("   ✓ Pantalla rellenada con VERDE");
-  delay(200);
-
-  gfx->fillScreen(BLUE);
-  Serial.println("   ✓ Pantalla rellenada con AZUL");
-  delay(200);
-
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  Serial.println("✅ Pantalla lista");
-
-  // Reservar memoria en PSRAM
-  Serial.println("\n💾 Reservando memoria PSRAM...");
-
-  audioBuffer = (int16_t *)ps_malloc(N_SAMPLES * sizeof(int16_t));
-  mfccOutput = (float *)ps_malloc(N_MFCC * N_FRAMES * sizeof(float));
-  vReal = (float *)ps_malloc(N_FFT * sizeof(float));
-  vImag = (float *)ps_malloc(N_FFT * sizeof(float));
-  melFilterbank = (float *)ps_malloc(N_MELS * (N_FFT / 2 + 1) * sizeof(float));
-  dctMatrix = (float *)ps_malloc(N_MFCC * N_MELS * sizeof(float));
-  hammingWindow = (float *)ps_malloc(N_FFT * sizeof(float));
-
-  if (!audioBuffer || !mfccOutput || !vReal || !vImag ||
-      !melFilterbank || !dctMatrix || !hammingWindow)
+  int num_emotions = output->dims->data[1];
+  for (int i = 0; i < num_emotions; i++)
   {
-    Serial.println("❌ Error: No se pudo reservar PSRAM");
-    while (1)
-      ;
-  }
+    // Dequantizar: float = (int8 - zero_point) * scale
+    int8_t quant_value = output->data.int8[i];
+    float prob = (quant_value - zero_point) * scale;
 
-  Serial.println("✅ PSRAM reservada");
+    // Usar etiqueta si existe, sino mostrar "emotion_N"
+    const char *label = (i < EXPECTED_NUM_EMOTIONS) ? emotion_labels[i] : "unknown";
 
-  // Inicializar micrófono
-  Serial.println("\n🎤 Inicializando micrófono I2S...");
-  while (!Microphone->begin(I2S_MODE_MASTER, AD_IIS_DATA_IN,
-                            I2S_CHANNEL_FMT_ONLY_LEFT, 16, SAMPLE_RATE))
-  {
-    Serial.println("❌ Micrófono no inicializado, reintentando...");
-    delay(2000);
-  }
-  Serial.println("✅ Micrófono listo");
+    Serial.printf("   %-10s: %6.2f%% (quant: %4d)\n",
+                  label, prob * 100, quant_value);
 
-  // Inicializar matrices de preprocesamiento
-  Serial.println("\n🔧 Inicializando matrices MFCC...");
-  initHammingWindow();
-  initMelFilterbank();
-  initDCTMatrix();
-
-  leds[0] = CRGB::Green;
-  FastLED.show();
-
-  Serial.println("\n✅ Sistema listo");
-  Serial.println("═══════════════════════════════════════\n");
-
-  // Mostrar pantalla de inicio
-  showStartScreen();
-}
-
-// ============================================
-// Loop
-// ============================================
-void loop()
-{
-  if (digitalRead(BUTTON_PIN) == LOW && !recording)
-  {
-    delay(50);
-    if (digitalRead(BUTTON_PIN) == LOW)
+    if (prob > max_prob)
     {
-      recording = true;
-      writeIndex = 0;
-
-      Serial.println("\n🔴 GRABANDO...");
-      leds[0] = CRGB::Red;
-      FastLED.show();
-
-      unsigned long startTotal = millis();
-      unsigned long startCapture = millis();
-      unsigned long captureStart = millis();
-
-      // Capturar audio con actualización de UI
-      while (millis() - captureStart < DURATION_SEC * 1000)
-      {
-        int16_t sample;
-        if (Microphone->IIS_Read_Data((char *)&sample, sizeof(int16_t)))
-        {
-          if (writeIndex < N_SAMPLES)
-          {
-            audioBuffer[writeIndex++] = sample;
-          }
-        }
-
-        // Actualizar UI cada 100ms
-        static unsigned long lastUIUpdate = 0;
-        if (millis() - lastUIUpdate > 100)
-        {
-          float progress = (float)(millis() - captureStart) / (DURATION_SEC * 1000);
-          showRecordingScreen(progress);
-          lastUIUpdate = millis();
-        }
-      }
-
-      timeCapture = millis() - startCapture;
-      Serial.printf("✅ Captura completada: %d samples en %lu ms\n", writeIndex, timeCapture);
-
-      leds[0] = CRGB::Yellow;
-      FastLED.show();
-
-      // Procesar a MFCCs
-      processAudioToMFCC();
-
-      timeTotal = millis() - startTotal;
-
-      // Mostrar resultados
-      showResultsScreen();
-      printMetrics();
-
-      recording = false;
-      leds[0] = CRGB::Green;
-      FastLED.show();
-
-      Serial.println("✅ Listo para otra grabación");
-      Serial.println("Presiona BTN para volver al inicio...");
-
-      // Esperar 5 segundos antes de volver
-      delay(5000);
-      showStartScreen();
+      max_prob = prob;
+      max_idx = i;
     }
   }
+
+  const char *predicted_label = (max_idx < EXPECTED_NUM_EMOTIONS) ? emotion_labels[max_idx] : "unknown";
+
+  Serial.println("   ────────────────────────────────────────────────────");
+  Serial.printf("   🎯 Emoción predicha: %s (%.2f%%)\n",
+                predicted_label, max_prob * 100);
+  Serial.println("   ────────────────────────────────────────────────────");
+
+  Serial.println("\n💡 Nota: Los datos de entrada son aleatorios,");
+  Serial.println("   así que el resultado no tiene sentido real.");
+  Serial.println("   Para inferencia real, reemplaza el input con MFCCs");
+  Serial.println("   de un audio procesado (40 MFCCs x 100 frames).");
+
+  unsigned long t_total = millis() - t_total_start;
+
+  Serial.println("\n✅ FASE 2 COMPLETADA");
+  Serial.println("════════════════════════════════════════════════════════");
+  Serial.println("\n🎉 Test finalizado exitosamente!");
+  Serial.printf("📦 Modelo probado: %s\n", getModelFileName(MODEL_PATH));
+  Serial.println("════════════════════════════════════════════════════════");
+
+  // Resumen de tiempos
+  Serial.println("\n⏱️  RESUMEN DE TIEMPOS DEL PIPELINE:");
+  Serial.println("════════════════════════════════════════════════════════");
+  Serial.println("FASE 1 - Inicialización:");
+  Serial.println("   [Ver tiempos individuales arriba]");
+  Serial.printf("   Subtotal FASE 1: %lu ms\n\n", t_fase1);
+  Serial.println("FASE 2 - Inferencia:");
+  Serial.printf("   • Inferencia (Invoke): %lu ms\n", elapsed);
+  Serial.printf("   Subtotal FASE 2: ~%lu ms\n\n", elapsed + 200); // Aproximado con overhead
+  Serial.printf("⏱️  TIEMPO TOTAL: %lu ms (%.2f seg)\n", t_total, t_total / 1000.0);
+  Serial.println("════════════════════════════════════════════════════════");
+}
+
+void loop()
+{
+  delay(1000);
 }
