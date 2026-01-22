@@ -8,13 +8,20 @@
 #include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
 #include "arduinoFFT.h"
+#include "pin_config.h"
+#include "Arduino_DriveBus_Library.h"
 
 // Declaraciones de funciones ROM de cache (ESP32-S3)
 extern "C" {
   void Cache_WriteBack_All(void);
 }
 
-#define VERSION "v4.0-memory-profiling"
+#define VERSION "v5.0-real-audio-pipeline"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIGURACION I2S - Micrófono MSM261S4030H0R
+// ═══════════════════════════════════════════════════════════════════════════
+#define IIS_DATA_BIT 16
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIGURACION DEL MODELO Y PIPELINE (v3.0)
@@ -76,13 +83,22 @@ int allocation_count = 0;
 
 // Tiempos globales para reporte final
 struct TimingData {
-  unsigned long gen_noise;
+  unsigned long audio_capture;  // Captura de audio real (antes era gen_noise)
   unsigned long init_matrices;
   unsigned long mfcc_extract;
   unsigned long fill_input;
   unsigned long invoke;
   unsigned long total;
 } timings;
+
+// Audio stats
+struct AudioStats {
+  float rms;
+  int16_t peak_pos;
+  int16_t peak_neg;
+  float avg_amplitude;
+  int zero_crossings;
+} audio_stats;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VARIABLES GLOBALES PARA EL PIPELINE
@@ -101,6 +117,11 @@ float* hammingWindow = nullptr;
 
 // FFT
 ArduinoFFT<float> FFT;
+
+// Micrófono I2S
+std::shared_ptr<Arduino_IIS_DriveBus> IIS_Bus =
+    std::make_shared<Arduino_HWIIS>(I2S_NUM_0, MSM261_BCLK, MSM261_WS, MSM261_DATA);
+std::unique_ptr<Arduino_IIS> Microphone(new Arduino_MEMS(IIS_Bus));
 
 // TFLite
 uint8_t* modelBuffer = nullptr;
@@ -221,6 +242,125 @@ void printMemoryStatus(const char* label) {
   Serial.printf("   DRAM:  %7d KB libres\n", getFreeHeap() / 1024);
   Serial.printf("   Heap largest block: %d KB\n",
                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FUNCIONES I2S - CAPTURA DE AUDIO REAL (Arduino_DriveBus_Library)
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool initMicrophone() {
+  Serial.println("   Inicializando micrófono I2S...");
+
+  bool success = Microphone->begin(I2S_MODE_MASTER, AD_IIS_DATA_IN,
+                                    I2S_CHANNEL_FMT_ONLY_LEFT, IIS_DATA_BIT, SAMPLE_RATE);
+
+  if (!success) {
+    Serial.println("   ERROR: No se pudo inicializar el micrófono");
+    return false;
+  }
+
+  Serial.printf("   I2S OK: %d Hz, BCLK=GPIO%d, WS=GPIO%d, DATA=GPIO%d\n",
+                SAMPLE_RATE, MSM261_BCLK, MSM261_WS, MSM261_DATA);
+  return true;
+}
+
+bool captureAudio() {
+  Serial.println("\n   ╔═══════════════════════════════════╗");
+  Serial.println("   ║  GRABANDO 4 SEGUNDOS DE AUDIO...  ║");
+  Serial.println("   ╚═══════════════════════════════════╝");
+
+  size_t writeIndex = 0;
+  unsigned long start_time = millis();
+  unsigned long duration_ms = AUDIO_DURATION_SEC * 1000;
+  int last_second_shown = -1;
+
+  while (millis() - start_time < duration_ms) {
+    int16_t sample;
+    if (Microphone->IIS_Read_Data((char*)&sample, sizeof(int16_t))) {
+      if (writeIndex < AUDIO_SAMPLES) {
+        audioBuffer[writeIndex++] = sample;
+      }
+    }
+
+    // Progreso cada segundo (solo una vez por segundo)
+    int current_second = (millis() - start_time) / 1000;
+    if (current_second > last_second_shown && current_second <= AUDIO_DURATION_SEC) {
+      Serial.printf("   -> %d s (%d samples)\n", current_second, writeIndex);
+      last_second_shown = current_second;
+    }
+  }
+
+  unsigned long total_time = millis() - start_time;
+  Serial.printf("   Captura completada: %d samples en %lu ms\n", writeIndex, total_time);
+
+  // Verificar que capturamos suficientes muestras
+  if (writeIndex < AUDIO_SAMPLES * 0.9) {
+    Serial.printf("   WARNING: Solo se capturaron %d/%d samples (%.1f%%)\n",
+                  writeIndex, AUDIO_SAMPLES, writeIndex * 100.0f / AUDIO_SAMPLES);
+  }
+
+  return writeIndex > 0;
+}
+
+void calculateAudioStats() {
+  // Calcular estadísticas del audio capturado
+  int64_t sum_squared = 0;
+  int64_t sum = 0;
+  audio_stats.peak_pos = INT16_MIN;
+  audio_stats.peak_neg = INT16_MAX;
+  audio_stats.zero_crossings = 0;
+
+  int16_t prev_sample = 0;
+
+  for (int i = 0; i < AUDIO_SAMPLES; i++) {
+    int16_t sample = audioBuffer[i];
+    sum += abs(sample);
+    sum_squared += (int64_t)sample * sample;
+
+    if (sample > audio_stats.peak_pos) audio_stats.peak_pos = sample;
+    if (sample < audio_stats.peak_neg) audio_stats.peak_neg = sample;
+
+    // Zero crossing
+    if (i > 0 && ((prev_sample >= 0 && sample < 0) || (prev_sample < 0 && sample >= 0))) {
+      audio_stats.zero_crossings++;
+    }
+    prev_sample = sample;
+  }
+
+  audio_stats.avg_amplitude = sum / (float)AUDIO_SAMPLES;
+  audio_stats.rms = sqrt(sum_squared / (double)AUDIO_SAMPLES);
+}
+
+float normalizeAudio(float target_db = -1.0f) {
+  // Encontrar pico máximo absoluto
+  int16_t max_abs = 0;
+  for (int i = 0; i < AUDIO_SAMPLES; i++) {
+    int16_t abs_val = abs(audioBuffer[i]);
+    if (abs_val > max_abs) max_abs = abs_val;
+  }
+
+  if (max_abs == 0) {
+    Serial.println("   WARNING: Audio es silencio total, no se puede normalizar");
+    return 1.0f;
+  }
+
+  // Calcular target peak (-1dB = 0.891 * 32767 ≈ 29205)
+  float target_linear = pow(10.0f, target_db / 20.0f);
+  int16_t target_peak = (int16_t)(target_linear * 32767);
+
+  // Factor de escala
+  float scale = (float)target_peak / max_abs;
+
+  // Aplicar normalización con clipping protection
+  for (int i = 0; i < AUDIO_SAMPLES; i++) {
+    int32_t scaled = (int32_t)(audioBuffer[i] * scale);
+    audioBuffer[i] = (int16_t)constrain(scaled, -32768, 32767);
+  }
+
+  Serial.printf("   Normalizacion: pico %d -> %d (x%.2f, target %.1f dB)\n",
+                max_abs, target_peak, scale, target_db);
+
+  return scale;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -549,33 +689,58 @@ void runMemoryProfiling() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PIPELINE COMPLETO CON DATOS DUMMY
+// PIPELINE COMPLETO CON AUDIO REAL
 // ═══════════════════════════════════════════════════════════════════════════
 
-void runDummyPipeline() {
+void runRealAudioPipeline() {
   Serial.println("\n");
   printSeparator();
-  Serial.println("FASE 2: PIPELINE CON RUIDO ALEATORIO");
+  Serial.println("FASE 2: PIPELINE CON AUDIO REAL DEL MICROFONO");
   printSeparator();
 
   unsigned long t_start, t_phase_start;
   t_phase_start = millis();
 
   // ═══════════════════════════════════════════════════════════════════════
-  // PASO 1: Generar ruido aleatorio (simula 4s de captura)
+  // PASO 1: Capturar audio real del micrófono (4 segundos)
   // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[1/5] GENERAR RUIDO (simula captura audio)");
+  Serial.println("\n[1/5] CAPTURA DE AUDIO REAL");
   printSubSeparator();
   t_start = millis();
 
-  for (int i = 0; i < AUDIO_SAMPLES; i++) {
-    audioBuffer[i] = (int16_t)(random(-16000, 16000));
+  if (!captureAudio()) {
+    Serial.println("   ERROR: Fallo la captura de audio");
+    return;
   }
 
-  timings.gen_noise = millis() - t_start;
+  timings.audio_capture = millis() - t_start;
+
+  // Calcular estadísticas del audio ANTES de normalizar
+  calculateAudioStats();
+
   Serial.printf("   Samples:     %d\n", AUDIO_SAMPLES);
-  Serial.printf("   Tiempo:      %lu ms\n", timings.gen_noise);
-  Serial.printf("   Nota: En produccion seran 4000 ms de captura real\n");
+  Serial.printf("   Tiempo:      %lu ms\n", timings.audio_capture);
+  Serial.println("\n   [ANTES de normalizar]");
+  Serial.printf("   RMS:         %.1f\n", audio_stats.rms);
+  Serial.printf("   Picos:       [%d, %d]\n", audio_stats.peak_neg, audio_stats.peak_pos);
+  Serial.printf("   Zero cross:  %d\n", audio_stats.zero_crossings);
+
+  // Validar nivel de señal
+  if (audio_stats.rms < 50) {
+    Serial.println("   WARNING: Nivel muy bajo - puede ser silencio");
+  }
+
+  // Normalizar audio a -1dB
+  Serial.println("\n   [NORMALIZANDO a -1dB]");
+  float gain_applied = normalizeAudio(-1.0f);
+
+  // Recalcular estadísticas DESPUES de normalizar
+  calculateAudioStats();
+
+  Serial.println("\n   [DESPUES de normalizar]");
+  Serial.printf("   RMS:         %.1f\n", audio_stats.rms);
+  Serial.printf("   Picos:       [%d, %d]\n", audio_stats.peak_neg, audio_stats.peak_pos);
+  Serial.printf("   Ganancia:    x%.2f (%.1f dB)\n", gain_applied, 20.0f * log10(gain_applied));
 
   // ═══════════════════════════════════════════════════════════════════════
   // PASO 2: Inicializar matrices MFCC
@@ -747,7 +912,8 @@ void runDummyPipeline() {
 
   Serial.println("   └────────────┴──────────┴───────────┘");
   Serial.printf("\n   >> PREDICCION: %s (%.1f%%)\n", emotion_labels[max_idx], max_prob * 100);
-  Serial.println("   >> (Resultado dummy - entrada es ruido aleatorio)");
+  Serial.printf("   >> Audio RMS: %.1f | Picos: [%d, %d]\n",
+                audio_stats.rms, audio_stats.peak_neg, audio_stats.peak_pos);
 
   // ═══════════════════════════════════════════════════════════════════════
   // TABLA DE TIEMPOS
@@ -764,8 +930,8 @@ void runDummyPipeline() {
   Serial.println("\n   ┌─────────────────────────┬──────────┬─────────┐");
   Serial.println("   │ Etapa                   │ Tiempo   │ % Total │");
   Serial.println("   ├─────────────────────────┼──────────┼─────────┤");
-  Serial.printf("   │ Generar ruido (dummy)   │ %5lu ms │ %5.1f%% │\n",
-                timings.gen_noise, timings.gen_noise * 100.0f / timings.total);
+  Serial.printf("   │ Captura audio (REAL)    │ %5lu ms │ %5.1f%% │\n",
+                timings.audio_capture, timings.audio_capture * 100.0f / timings.total);
   Serial.printf("   │ Init matrices MFCC      │ %5lu ms │ %5.1f%% │\n",
                 timings.init_matrices, timings.init_matrices * 100.0f / timings.total);
   Serial.printf("   │ Extraer MFCCs           │ %5lu ms │ %5.1f%% │\n",
@@ -778,11 +944,13 @@ void runDummyPipeline() {
   Serial.printf("   │ TOTAL                   │ %5lu ms │ 100.0%% │\n", timings.total);
   Serial.println("   └─────────────────────────┴──────────┴─────────┘");
 
-  Serial.println("\n   PROYECCION PARA PRODUCCION:");
-  Serial.printf("   - Captura audio real:  4000 ms (fijo)\n");
-  Serial.printf("   - Procesamiento:       %4lu ms\n", t_proceso);
-  Serial.printf("   - CICLO TOTAL:         %4lu ms (%.1f seg)\n",
-                4000 + t_proceso, (4000 + t_proceso) / 1000.0f);
+  Serial.println("\n   DESGLOSE:");
+  Serial.printf("   - Captura audio:       %4lu ms (%.1f%%)\n",
+                timings.audio_capture, timings.audio_capture * 100.0f / timings.total);
+  Serial.printf("   - Procesamiento:       %4lu ms (%.1f%%)\n",
+                t_proceso, t_proceso * 100.0f / timings.total);
+  Serial.printf("   - CICLO TOTAL REAL:    %4lu ms (%.1f seg)\n",
+                timings.total, timings.total / 1000.0f);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -795,7 +963,7 @@ void setup() {
 
   Serial.println("\n\n");
   printSeparator();
-  Serial.println("MoodLink - Test 4: Memory Profiling + Pipeline Dummy");
+  Serial.println("MoodLink - Test 5: Pipeline con Audio Real");
   printSeparator();
   Serial.printf("VERSION: %s\n", VERSION);
   Serial.printf("Modelo:  %s\n", MODEL_PATH);
@@ -806,22 +974,32 @@ void setup() {
   Serial.printf("  MFCC:   %d coefs x %d frames (HOP=%d)\n", N_MFCC, N_FRAMES, HOP_LENGTH);
   Serial.printf("  FFT:    %d puntos, %d mel bands\n", N_FFT, N_MELS);
   Serial.printf("  Output: %d emociones\n", EXPECTED_NUM_EMOTIONS);
+  Serial.printf("  Mic:    MSM261 (BCLK=%d, WS=%d, DATA=%d)\n", MSM261_BCLK, MSM261_WS, MSM261_DATA);
 
   delay(1000);
 
-  // FASE 1: Memory profiling
+  // FASE 1: Memory profiling + inicialización micrófono
   runMemoryProfiling();
 
-  delay(2000);
+  Serial.println("\n[MICROFONO]");
+  printSubSeparator();
+  if (!initMicrophone()) {
+    Serial.println("ERROR FATAL: No se pudo inicializar el microfono");
+    while(1) { delay(1000); }
+  }
 
-  // FASE 2: Pipeline con datos dummy
-  runDummyPipeline();
+  delay(2000);
+  Serial.println("\n*** PREPARATE PARA HABLAR EN 3 SEGUNDOS ***");
+  delay(3000);
+
+  // FASE 2: Pipeline con audio real
+  runRealAudioPipeline();
 
   Serial.println("\n");
   printSeparator();
-  Serial.println("TEST 4 FINALIZADO");
+  Serial.println("TEST 5 FINALIZADO - PIPELINE AUDIO REAL");
   printSeparator();
-  Serial.println("\nValores listos para Test 5 (Pipeline con audio real)");
+  Serial.println("\nResultados guardados. Proximo: Test 6 (Optimizacion)");
 }
 
 void loop() {
