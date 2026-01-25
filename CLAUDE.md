@@ -9,9 +9,21 @@ Audio 4s (44.1kHz) -> Normalizar -1dB -> MFCC (40x100) -> TFLite INT8 -> 7 emoci
 ```
 
 ## Estado Actual
-- **Branch**: `test/v5-real-audio-pipeline`
-- **Test completado**: Test 5 - Pipeline con Audio Real
+- **Branch**: `test/v5.3-profiling-csv`
+- **Test completado**: Test 5.1 (modular) + Test 5.3 (profiling CSV)
 - **Siguiente**: Test 6 - Optimizacion
+
+## Estructura del Codigo (v5.1+)
+
+```
+src/
+├── config.h              # Constantes del pipeline
+├── audio_capture.h/cpp   # Captura I2S, normalizacion
+├── mfcc_extractor.h/cpp  # Extraccion de MFCCs
+├── emotion_model.h/cpp   # Inferencia TFLite
+├── profiler.h/cpp        # Metricas y CSV (v5.3)
+└── main.cpp              # Orquestador principal
+```
 
 ## Resultados Test 5 (22-Ene-2026)
 
@@ -29,15 +41,6 @@ Audio 4s (44.1kHz) -> Normalizar -1dB -> MFCC (40x100) -> TFLite INT8 -> 7 emoci
 |------------|--------|
 | Total consumida | 742 KB (9.1%) |
 | Libre | 7447 KB |
-
-### Normalizacion de Audio
-- Automatica a -1dB post-captura
-- Pico target: 29203 (de 32767)
-- Calcula RMS, picos, zero crossings
-
-### Problema Conocido
-El modelo predice "anger" siempre, independiente del tono.
-Causa: modelo/dataset. Solucion: cambiar modelo en Test 6+.
 
 ## Configuracion Hardware
 
@@ -75,21 +78,54 @@ Output shape      [1, 7] INT8
 Emociones         anger, disgust, fear, happy, neutral, sad, surprise
 ```
 
+## Profiling CSV (Test 5.3)
+
+### Comandos Serial
+| Comando | Accion |
+|---------|--------|
+| `d` | Dump CSV al Serial |
+| `r` | Reset CSV |
+| `c` | Count iteraciones |
+| `p` | Pause/resume |
+| `s` | Skip espera |
+
+### Columnas CSV
+```
+iteration, timestamp_ms, psram_free_kb, psram_used_kb, dram_free_kb,
+time_capture_ms, time_normalize_ms, time_mfcc_ms, time_inference_ms, time_total_ms,
+audio_rms, audio_peak_pos, audio_peak_neg, emotion_index, confidence
+```
+
 ## Plan de Tests
 | Test | Descripcion | Status |
 |------|-------------|--------|
 | Test 1-3 | Versiones anteriores | Completados |
 | Test 4 | Memory Profiling | Completado |
-| Test 5 | Pipeline con audio real | **COMPLETADO** |
-| Test 6 | Optimizacion | Pendiente |
-| Test 7 | Producto final (loop continuo) | Pendiente |
+| Test 5 | Pipeline con audio real | Completado |
+| Test 5.1 | Refactor modular | **COMPLETADO** |
+| Test 5.3 | Profiling con CSV | **COMPLETADO** |
+| Test 6 | Optimizacion | **PENDIENTE** |
+| Test 7 | Producto final | Pendiente |
 
-## Archivos Clave
-- `src/main.cpp` - Codigo principal (Test 5)
-- `lib/Mylibrary/pin_config.h` - Pines del hardware
-- `data/ser_202601_optimized_int8.tflite` - Modelo (36 KB)
-- `docs/RESUMEN_SESION_2026-01-22.md` - Ultima sesion
-- `docs/PLAN_TESTEO_V4.md` - Plan detallado de tests
+## Test 6 - Optimizacion (Proximo)
+
+### Objetivo
+Reducir tiempo y memoria.
+
+### Estrategias
+1. Reducir kTensorArena al minimo
+2. Evaluar ESP-NN acceleration
+3. Procesar MFCC por bloques
+4. Reusar buffers
+
+### Criterios de exito
+- Memoria < 1.5MB
+- Tiempo total (MFCC + inferencia) < 8s
+
+### Preparacion
+1. Correr Test 5.3 varias iteraciones
+2. Exportar CSV con comando `d`
+3. Analizar baseline de tiempos y memoria
 
 ## Compilacion
 
@@ -100,15 +136,23 @@ pio run
 # Subir
 pio run -t upload
 
-# Monitor
+# Monitor (con input para comandos)
 pio device monitor
 ```
 
 ## Git
 ```bash
 # Branch actual
-git branch  # test/v5-real-audio-pipeline
+git branch  # test/v5.3-profiling-csv
 
-# Push (siempre a la branch, no a main)
-git push origin test/v5-real-audio-pipeline
+# Branches disponibles
+git branch -a
+
+# Push
+git push origin test/v5.3-profiling-csv
 ```
+
+## Archivos de Documentacion
+- `docs/RESUMEN_SESION_2026-01-25.md` - Sesion actual
+- `docs/RESUMEN_SESION_2026-01-22.md` - Test 5
+- `docs/PLAN_TESTEO_V4.md` - Plan detallado de tests
