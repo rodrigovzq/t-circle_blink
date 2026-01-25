@@ -4,17 +4,31 @@
 #include "audio_capture.h"
 #include "mfcc_extractor.h"
 #include "emotion_model.h"
+#include "profiler.h"
 
 // =============================================================================
-// MoodLink - Test 5.1: Pipeline Modular
+// MoodLink - Test 5.3: Pipeline con Profiling y CSV
 // =============================================================================
-// Pipeline de reconocimiento de emociones por voz:
-//   Audio (I2S) -> Normalización -> MFCC -> TFLite -> Emoción
+// Pipeline de reconocimiento de emociones con métricas de memoria y tiempo.
+// Los datos se guardan en /profiling.csv para exportar y analizar.
 // =============================================================================
+
+#define CSV_FILENAME "/profiling.csv"
 
 // Buffers del pipeline (alocados en PSRAM)
 static int16_t* audio_buffer = nullptr;
 static float* mfcc_buffer = nullptr;
+
+// Contador de iteraciones
+static uint32_t iteration_count = 0;
+
+// Perfil de memoria de inicialización
+static InitMemoryProfile init_memory;
+
+// -----------------------------------------------------------------------------
+// Prototipos
+// -----------------------------------------------------------------------------
+static void print_help();
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -24,18 +38,19 @@ static void print_separator() {
     Serial.println("================================================================");
 }
 
-static void print_memory_status(const char* label) {
-    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-    Serial.printf("[%s] PSRAM: %d KB libres / %d KB total\n",
-                  label, psram_free / 1024, psram_total / 1024);
+static uint32_t get_psram_free_kb() {
+    return heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
+}
+
+static uint32_t get_psram_total_kb() {
+    return heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024;
+}
+
+static uint32_t get_dram_free_kb() {
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
 }
 
 static void print_result(const EmotionResult& result) {
-    print_separator();
-    Serial.println("RESULTADO");
-    print_separator();
-
     Serial.println("\n  Emocion      | Probabilidad");
     Serial.println("  -------------|-------------");
 
@@ -59,64 +74,179 @@ void setup() {
     delay(2000);
 
     print_separator();
-    Serial.println("MoodLink - Test 5.1: Pipeline Modular");
+    Serial.println("MoodLink - Test 5.3: Pipeline con Profiling");
     Serial.printf("Version: %s\n", VERSION);
+    Serial.printf("CSV Output: %s\n", CSV_FILENAME);
     print_separator();
 
-    print_memory_status("INICIO");
+    // Guardar PSRAM inicial
+    init_memory.psram_initial_kb = get_psram_free_kb();
+    Serial.printf("\n[MEMORIA] PSRAM inicial: %u KB\n", init_memory.psram_initial_kb);
 
     // -------------------------------------------------------------------------
     // 1. Alocar buffers del pipeline
     // -------------------------------------------------------------------------
-    Serial.println("\n[1/4] Alocando buffers...");
+    Serial.println("\n[1/5] Alocando buffers...");
+
+    size_t audio_size = AUDIO_SAMPLES * sizeof(int16_t);
+    size_t mfcc_size = N_MFCC * N_FRAMES * sizeof(float);
 
     audio_buffer = (int16_t*)heap_caps_aligned_alloc(
-        16, AUDIO_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        16, audio_size, MALLOC_CAP_SPIRAM);
 
     mfcc_buffer = (float*)heap_caps_aligned_alloc(
-        16, N_MFCC * N_FRAMES * sizeof(float), MALLOC_CAP_SPIRAM);
+        16, mfcc_size, MALLOC_CAP_SPIRAM);
 
     if (!audio_buffer || !mfcc_buffer) {
         Serial.println("ERROR: No se pudieron alocar buffers");
         while (1) delay(1000);
     }
 
-    Serial.printf("  audio_buffer: %d KB\n", (AUDIO_SAMPLES * sizeof(int16_t)) / 1024);
-    Serial.printf("  mfcc_buffer:  %d KB\n", (N_MFCC * N_FRAMES * sizeof(float)) / 1024);
+    init_memory.audio_buffer_kb = audio_size / 1024.0f;
+    init_memory.mfcc_buffer_kb = mfcc_size / 1024.0f;
+
+    Serial.printf("  audio_buffer: %.1f KB\n", init_memory.audio_buffer_kb);
+    Serial.printf("  mfcc_buffer:  %.1f KB\n", init_memory.mfcc_buffer_kb);
 
     // -------------------------------------------------------------------------
     // 2. Inicializar módulos
     // -------------------------------------------------------------------------
-    Serial.println("\n[2/4] Inicializando audio...");
+    Serial.println("\n[2/5] Inicializando audio...");
     if (!audio_init()) {
         Serial.println("ERROR: Fallo audio_init()");
         while (1) delay(1000);
     }
 
-    Serial.println("\n[3/4] Inicializando MFCC...");
+    Serial.println("\n[3/5] Inicializando MFCC...");
     if (!mfcc_init()) {
         Serial.println("ERROR: Fallo mfcc_init()");
         while (1) delay(1000);
     }
+    init_memory.mfcc_internal_kb = mfcc_get_internal_memory_bytes() / 1024.0f;
+    Serial.printf("  MFCC internal: %.1f KB\n", init_memory.mfcc_internal_kb);
 
-    Serial.println("\n[4/4] Cargando modelo...");
+    Serial.println("\n[4/5] Cargando modelo...");
     if (!model_load(MODEL_PATH)) {
         Serial.println("ERROR: Fallo model_load()");
         while (1) delay(1000);
     }
+    init_memory.model_buffer_kb = model_get_size_bytes() / 1024.0f;
+    init_memory.tensor_arena_kb = model_get_arena_size_bytes() / 1024.0f;
+    Serial.printf("  Model: %.1f KB  |  Arena: %.1f KB\n",
+                  init_memory.model_buffer_kb, init_memory.tensor_arena_kb);
 
-    print_memory_status("POST-INIT");
+    // Calcular memoria total
+    init_memory.psram_after_init_kb = get_psram_free_kb();
+    init_memory.total_allocated_kb = init_memory.psram_initial_kb - init_memory.psram_after_init_kb;
 
-    Serial.println("\n========== SISTEMA LISTO ==========\n");
+    // -------------------------------------------------------------------------
+    // 5. Inicializar profiler
+    // -------------------------------------------------------------------------
+    Serial.println("\n[5/5] Inicializando profiler...");
+    if (!profiler_init(CSV_FILENAME)) {
+        Serial.println("ERROR: Fallo profiler_init()");
+        while (1) delay(1000);
+    }
+
+    // Guardar y mostrar perfil de memoria inicial
+    profiler_log_init_memory(init_memory);
+    profiler_print_init_memory(init_memory);
+
+    Serial.println("\n========== SISTEMA LISTO ==========");
+    Serial.printf("Iteraciones previas en CSV: %d\n", profiler_get_row_count());
+    print_help();
 }
 
 // -----------------------------------------------------------------------------
-// Loop - Pipeline principal
+// Comandos Serial
+// -----------------------------------------------------------------------------
+
+static void print_help() {
+    Serial.println("\n=== COMANDOS DISPONIBLES ===");
+    Serial.println("  d, dump   - Exportar CSV al Serial");
+    Serial.println("  r, reset  - Borrar CSV y empezar de nuevo");
+    Serial.println("  c, count  - Mostrar cantidad de iteraciones");
+    Serial.println("  s, skip   - Saltar espera e iniciar grabación");
+    Serial.println("  h, help   - Mostrar esta ayuda");
+    Serial.println("  p, pause  - Pausar/reanudar el loop");
+    Serial.println("============================\n");
+}
+
+static bool paused = false;
+
+static void handle_serial_commands() {
+    while (Serial.available()) {
+        char cmd = Serial.read();
+
+        switch (cmd) {
+            case 'd':
+                profiler_dump_csv();
+                break;
+            case 'r':
+                profiler_reset_csv();
+                iteration_count = 0;
+                break;
+            case 'c':
+                Serial.printf("[Profiler] Iteraciones en CSV: %d\n", profiler_get_row_count());
+                break;
+            case 'h':
+                print_help();
+                break;
+            case 'p':
+                paused = !paused;
+                Serial.printf("[Sistema] %s\n", paused ? "PAUSADO" : "REANUDADO");
+                break;
+            case 's':
+                // Se maneja en el loop
+                break;
+            case '\n':
+            case '\r':
+                // Ignorar
+                break;
+            default:
+                Serial.printf("[?] Comando '%c' no reconocido. Usa 'h' para ayuda.\n", cmd);
+                break;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Loop - Pipeline principal con profiling
 // -----------------------------------------------------------------------------
 
 void loop() {
-    Serial.println("\n*** Preparate para hablar en 3 segundos ***\n");
-    delay(3000);
+    // Procesar comandos Serial
+    handle_serial_commands();
+
+    // Si está pausado, solo procesar comandos
+    if (paused) {
+        delay(100);
+        return;
+    }
+
+    iteration_count++;
+
+    Serial.printf("\n*** Iteración #%u - Preparate para hablar (3 seg, 's' para saltar) ***\n", iteration_count);
+
+    // Espera con opción de saltar
+    for (int i = 0; i < 30; i++) {  // 30 * 100ms = 3 segundos
+        delay(100);
+        if (Serial.available() && Serial.peek() == 's') {
+            Serial.read();  // Consumir el 's'
+            Serial.println("[!] Saltando espera...");
+            break;
+        }
+    }
+
+    // Estructura para métricas de esta iteración
+    PipelineMetrics metrics = {0};
+    metrics.iteration = iteration_count;
+    metrics.timestamp_ms = millis();
+
+    // Memoria al inicio de la iteración
+    metrics.psram_free_kb = get_psram_free_kb();
+    metrics.psram_used_kb = get_psram_total_kb() - metrics.psram_free_kb;
+    metrics.dram_free_kb = get_dram_free_kb();
 
     unsigned long pipeline_start = millis();
 
@@ -131,55 +261,61 @@ void loop() {
         return;
     }
 
-    // Estadísticas pre-normalización
-    AudioStats stats_before = audio_get_stats(audio_buffer);
-    Serial.printf("[Audio] Pre-norm  - RMS: %.1f, Picos: [%d, %d]\n",
-                  stats_before.rms, stats_before.peak_neg, stats_before.peak_pos);
-
-    // Normalizar
-    audio_normalize(audio_buffer);
-
-    // Estadísticas post-normalización
-    AudioStats stats_after = audio_get_stats(audio_buffer);
-    Serial.printf("[Audio] Post-norm - RMS: %.1f, Picos: [%d, %d]\n",
-                  stats_after.rms, stats_after.peak_neg, stats_after.peak_pos);
-
-    unsigned long t1_end = millis();
+    metrics.time_capture_ms = millis() - t1;
 
     // -------------------------------------------------------------------------
-    // Etapa 2: Extraer MFCCs
+    // Etapa 2: Normalizar
     // -------------------------------------------------------------------------
     unsigned long t2 = millis();
 
-    mfcc_extract(audio_buffer, mfcc_buffer);
+    audio_normalize(audio_buffer);
 
-    unsigned long t2_end = millis();
+    metrics.time_normalize_ms = millis() - t2;
+
+    // Estadísticas de audio
+    AudioStats stats = audio_get_stats(audio_buffer);
+    metrics.audio_rms = stats.rms;
+    metrics.audio_peak_pos = stats.peak_pos;
+    metrics.audio_peak_neg = stats.peak_neg;
+
+    Serial.printf("[Audio] RMS: %.1f, Picos: [%d, %d]\n",
+                  stats.rms, stats.peak_neg, stats.peak_pos);
 
     // -------------------------------------------------------------------------
-    // Etapa 3: Inferencia
+    // Etapa 3: Extraer MFCCs
     // -------------------------------------------------------------------------
     unsigned long t3 = millis();
 
+    mfcc_extract(audio_buffer, mfcc_buffer);
+
+    metrics.time_mfcc_ms = millis() - t3;
+
+    // -------------------------------------------------------------------------
+    // Etapa 4: Inferencia
+    // -------------------------------------------------------------------------
+    unsigned long t4 = millis();
+
     EmotionResult result = model_predict(mfcc_buffer);
 
-    unsigned long t3_end = millis();
+    metrics.time_inference_ms = millis() - t4;
 
     // -------------------------------------------------------------------------
+    // Finalizar métricas
+    // -------------------------------------------------------------------------
+    metrics.time_total_ms = millis() - pipeline_start;
+    metrics.emotion_index = result.index;
+    metrics.confidence = result.confidence;
+
+    // Guardar en CSV
+    profiler_log_iteration(metrics);
+
     // Mostrar resultado
-    // -------------------------------------------------------------------------
-    unsigned long pipeline_end = millis();
-
     print_result(result);
 
-    // Resumen de tiempos
-    Serial.println("\nTIEMPOS:");
-    Serial.printf("  Captura + Norm: %4lu ms\n", t1_end - t1);
-    Serial.printf("  MFCC:           %4lu ms\n", t2_end - t2);
-    Serial.printf("  Inferencia:     %4lu ms\n", t3_end - t3);
-    Serial.printf("  ----------------------\n");
-    Serial.printf("  TOTAL:          %4lu ms\n", pipeline_end - pipeline_start);
+    // Mostrar métricas en Serial
+    profiler_print_iteration(metrics);
 
-    print_separator();
+    Serial.printf("\n[CSV] Datos guardados en %s\n", CSV_FILENAME);
 
     // Esperar antes del próximo ciclo
     delay(2000);

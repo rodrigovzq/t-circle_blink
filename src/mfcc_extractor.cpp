@@ -176,3 +176,14 @@ void mfcc_deinit() {
 
     vReal = vImag = melFilterbank = dctMatrix = hammingWindow = nullptr;
 }
+
+size_t mfcc_get_internal_memory_bytes() {
+    // vReal + vImag + melFilterbank + dctMatrix + hammingWindow
+    size_t total = 0;
+    total += N_FFT * sizeof(float);              // vReal
+    total += N_FFT * sizeof(float);              // vImag
+    total += N_MELS * MEL_COLS * sizeof(float);  // melFilterbank
+    total += N_MFCC * N_MELS * sizeof(float);    // dctMatrix
+    total += N_FFT * sizeof(float);              // hammingWindow
+    return total;
+}

@@ -207,3 +207,11 @@ void model_unload() {
     inputTensor = nullptr;
     outputTensor = nullptr;
 }
+
+size_t model_get_size_bytes() {
+    return modelSize;
+}
+
+size_t model_get_arena_size_bytes() {
+    return TENSOR_ARENA_SIZE;
+}

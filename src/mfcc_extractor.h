@@ -2,6 +2,7 @@
 #define MFCC_EXTRACTOR_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 // =============================================================================
 // Extracción de MFCCs
@@ -19,5 +20,8 @@ void mfcc_extract(const int16_t* audio_in, float* mfcc_out);
 
 // Libera memoria interna (opcional, para cleanup)
 void mfcc_deinit();
+
+// Retorna la cantidad de memoria interna usada (en bytes)
+size_t mfcc_get_internal_memory_bytes();
 
 #endif // MFCC_EXTRACTOR_H

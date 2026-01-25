@@ -2,6 +2,7 @@
 #define EMOTION_MODEL_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 // =============================================================================
 // Modelo de Reconocimiento de Emociones (TFLite)
@@ -26,5 +27,11 @@ EmotionResult model_predict(const float* mfcc_in);
 
 // Libera memoria del modelo (opcional)
 void model_unload();
+
+// Retorna el tamaño del modelo en bytes
+size_t model_get_size_bytes();
+
+// Retorna el tamaño del tensor arena en bytes
+size_t model_get_arena_size_bytes();
 
 #endif // EMOTION_MODEL_H
