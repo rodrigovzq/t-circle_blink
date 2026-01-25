@@ -1,829 +1,322 @@
 #include <Arduino.h>
-#include <LittleFS.h>
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
-#include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/system_setup.h"
-#include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "esp_heap_caps.h"
-#include "esp_task_wdt.h"
-#include "arduinoFFT.h"
+#include "config.h"
+#include "audio_capture.h"
+#include "mfcc_extractor.h"
+#include "emotion_model.h"
+#include "profiler.h"
 
-// Declaraciones de funciones ROM de cache (ESP32-S3)
-extern "C" {
-  void Cache_WriteBack_All(void);
+// =============================================================================
+// MoodLink - Test 5.3: Pipeline con Profiling y CSV
+// =============================================================================
+// Pipeline de reconocimiento de emociones con métricas de memoria y tiempo.
+// Los datos se guardan en /profiling.csv para exportar y analizar.
+// =============================================================================
+
+#define CSV_FILENAME "/profiling.csv"
+
+// Buffers del pipeline (alocados en PSRAM)
+static int16_t* audio_buffer = nullptr;
+static float* mfcc_buffer = nullptr;
+
+// Contador de iteraciones
+static uint32_t iteration_count = 0;
+
+// Perfil de memoria de inicialización
+static InitMemoryProfile init_memory;
+
+// -----------------------------------------------------------------------------
+// Prototipos
+// -----------------------------------------------------------------------------
+static void print_help();
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+static void print_separator() {
+    Serial.println("================================================================");
 }
 
-#define VERSION "v4.0-memory-profiling"
-
-// ═══════════════════════════════════════════════════════════════════════════
-// CONFIGURACION DEL MODELO Y PIPELINE (v3.0)
-// ═══════════════════════════════════════════════════════════════════════════
-const char *MODEL_PATH = "/ser_202601_optimized_int8.tflite";
-
-// Audio parameters
-constexpr int SAMPLE_RATE = 44100;
-constexpr int AUDIO_DURATION_SEC = 4;
-constexpr int AUDIO_SAMPLES = SAMPLE_RATE * AUDIO_DURATION_SEC; // 176400
-
-// MFCC parameters (v3.0 model - optimizado)
-constexpr int N_MFCC = 40;
-constexpr int N_FRAMES = 100;
-constexpr int N_MELS = 40;
-constexpr int N_FFT = 2048;
-constexpr int HOP_LENGTH = (AUDIO_SAMPLES - N_FFT) / (N_FRAMES - 1); // ~1762
-
-// Normalizacion de MFCCs (valores del modelo v3.0)
-constexpr float MFCC_MEAN = -8.0306f;
-constexpr float MFCC_STD = 82.2183f;
-
-// TFLite parameters
-constexpr int EXPECTED_INPUT_HEIGHT = 40;   // MFCCs
-constexpr int EXPECTED_INPUT_WIDTH = 100;   // Frames
-constexpr int EXPECTED_INPUT_CHANNELS = 1;
-constexpr int EXPECTED_NUM_EMOTIONS = 7;
-
-// Nombres de emociones
-const char *emotion_labels[] = {
-    "anger", "disgust", "fear", "happy", "neutral", "sad", "surprise"
-};
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ESTRUCTURA PARA TRACKING DE MEMORIA
-// ═══════════════════════════════════════════════════════════════════════════
-enum MemoryLocation {
-  MEM_PSRAM,
-  MEM_DRAM,
-  MEM_FLASH
-};
-
-struct MemoryAllocation {
-  const char* name;
-  const char* type_str;      // tipo de dato (int16_t, float, uint8_t)
-  size_t size_bytes;
-  size_t psram_before;
-  size_t psram_after;
-  size_t dram_before;
-  size_t dram_after;
-  void* ptr;
-  MemoryLocation location;
-  bool success;
-};
-
-#define MAX_ALLOCATIONS 20
-MemoryAllocation allocations[MAX_ALLOCATIONS];
-int allocation_count = 0;
-
-// Tiempos globales para reporte final
-struct TimingData {
-  unsigned long gen_noise;
-  unsigned long init_matrices;
-  unsigned long mfcc_extract;
-  unsigned long fill_input;
-  unsigned long invoke;
-  unsigned long total;
-} timings;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// VARIABLES GLOBALES PARA EL PIPELINE
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Audio
-int16_t* audioBuffer = nullptr;
-
-// MFCC
-float* mfccOutput = nullptr;
-float* vReal = nullptr;
-float* vImag = nullptr;
-float* melFilterbank = nullptr;
-float* dctMatrix = nullptr;
-float* hammingWindow = nullptr;
-
-// FFT
-ArduinoFFT<float> FFT;
-
-// TFLite
-uint8_t* modelBuffer = nullptr;
-uint8_t* tensor_arena = nullptr;
-size_t modelSize = 0;
-size_t arena_optimal = 0;
-
-const tflite::Model* model = nullptr;
-tflite::MicroInterpreter* interpreter = nullptr;
-TfLiteTensor* input_tensor = nullptr;
-TfLiteTensor* output_tensor = nullptr;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// FUNCIONES DE UTILIDAD
-// ═══════════════════════════════════════════════════════════════════════════
-void printSeparator() {
-  Serial.println("═══════════════════════════════════════════════════════════════");
+static uint32_t get_psram_free_kb() {
+    return heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
 }
 
-void printSubSeparator() {
-  Serial.println("───────────────────────────────────────────────────────────────");
+static uint32_t get_psram_total_kb() {
+    return heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024;
 }
 
-size_t getFreePSRAM() {
-  return heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+static uint32_t get_dram_free_kb() {
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
 }
 
-size_t getFreeHeap() {
-  return heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-}
+static void print_result(const EmotionResult& result) {
+    Serial.println("\n  Emocion      | Probabilidad");
+    Serial.println("  -------------|-------------");
 
-size_t getTotalPSRAM() {
-  return heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-}
-
-const char* getMemLocationStr(MemoryLocation loc) {
-  switch(loc) {
-    case MEM_PSRAM: return "PSRAM";
-    case MEM_DRAM:  return "DRAM";
-    case MEM_FLASH: return "FLASH";
-    default: return "???";
-  }
-}
-
-void* allocateAndTrack(const char* name, const char* type_str, size_t size, MemoryLocation target = MEM_PSRAM) {
-  if (allocation_count >= MAX_ALLOCATIONS) {
-    Serial.println("ERROR: Too many allocations!");
-    return nullptr;
-  }
-
-  MemoryAllocation& alloc = allocations[allocation_count];
-  alloc.name = name;
-  alloc.type_str = type_str;
-  alloc.size_bytes = size;
-  alloc.psram_before = getFreePSRAM();
-  alloc.dram_before = getFreeHeap();
-  alloc.location = target;
-
-  if (target == MEM_PSRAM) {
-    alloc.ptr = heap_caps_aligned_alloc(16, size, MALLOC_CAP_SPIRAM);
-  } else if (target == MEM_DRAM) {
-    alloc.ptr = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  } else {
-    // FLASH - no se aloca, solo se registra
-    alloc.ptr = (void*)1; // dummy
-  }
-
-  alloc.psram_after = getFreePSRAM();
-  alloc.dram_after = getFreeHeap();
-  alloc.success = (alloc.ptr != nullptr);
-
-  allocation_count++;
-
-  return alloc.ptr;
-}
-
-void printAllocationTable() {
-  Serial.println("\n┌────────────────────┬────────────┬──────────┬────────┬────────────┐");
-  Serial.println("│ Buffer             │ Tipo       │ Tamaño   │ Ubicac │ Delta Real │");
-  Serial.println("├────────────────────┼────────────┼──────────┼────────┼────────────┤");
-
-  size_t total_psram = 0;
-  size_t total_dram = 0;
-  size_t total_flash = 0;
-
-  for (int i = 0; i < allocation_count; i++) {
-    MemoryAllocation& a = allocations[i];
-
-    size_t delta = 0;
-    if (a.location == MEM_PSRAM) {
-      delta = a.psram_before - a.psram_after;
-      total_psram += delta;
-    } else if (a.location == MEM_DRAM) {
-      delta = a.dram_before - a.dram_after;
-      total_dram += delta;
-    } else {
-      delta = a.size_bytes;
-      total_flash += delta;
+    for (int i = 0; i < NUM_EMOTIONS; i++) {
+        const char* marker = (i == result.index) ? " <<" : "";
+        Serial.printf("  %-12s | %6.2f%%%s\n",
+                      EMOTION_LABELS[i],
+                      result.probabilities[i] * 100,
+                      marker);
     }
 
-    char status = a.success ? ' ' : 'X';
-    Serial.printf("│ %-18s │ %-10s │ %6.1f KB│ %-6s │ %6.1f KB %c│\n",
-                  a.name, a.type_str, a.size_bytes / 1024.0f,
-                  getMemLocationStr(a.location), delta / 1024.0f, status);
-  }
-
-  Serial.println("├────────────────────┴────────────┴──────────┴────────┴────────────┤");
-  Serial.printf("│ TOTAL PSRAM:  %7.1f KB                                        │\n", total_psram / 1024.0f);
-  Serial.printf("│ TOTAL DRAM:   %7.1f KB                                        │\n", total_dram / 1024.0f);
-  Serial.printf("│ TOTAL FLASH:  %7.1f KB                                        │\n", total_flash / 1024.0f);
-  Serial.println("└───────────────────────────────────────────────────────────────────┘");
+    Serial.printf("\n  >> %s (%.1f%%)\n", result.label, result.confidence * 100);
 }
 
-void printMemoryStatus(const char* label) {
-  Serial.printf("\n[%s]\n", label);
-  Serial.printf("   PSRAM: %7d KB libres / %d KB total\n",
-                getFreePSRAM() / 1024, getTotalPSRAM() / 1024);
-  Serial.printf("   DRAM:  %7d KB libres\n", getFreeHeap() / 1024);
-  Serial.printf("   Heap largest block: %d KB\n",
-                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// INICIALIZACION DE MATRICES MFCC
-// ═══════════════════════════════════════════════════════════════════════════
-
-void initHammingWindow() {
-  for (int i = 0; i < N_FFT; i++) {
-    hammingWindow[i] = 0.54f - 0.46f * cos(2.0f * PI * i / (N_FFT - 1));
-  }
-}
-
-void initMelFilterbank() {
-  auto hzToMel = [](float hz) { return 2595.0f * log10(1.0f + hz / 700.0f); };
-  auto melToHz = [](float mel) { return 700.0f * (pow(10.0f, mel / 2595.0f) - 1.0f); };
-
-  float melMin = hzToMel(0);
-  float melMax = hzToMel(SAMPLE_RATE / 2.0f);
-
-  float melPoints[N_MELS + 2];
-  for (int i = 0; i < N_MELS + 2; i++) {
-    melPoints[i] = melMin + (melMax - melMin) * i / (N_MELS + 1);
-  }
-
-  int bins[N_MELS + 2];
-  for (int i = 0; i < N_MELS + 2; i++) {
-    float hz = melToHz(melPoints[i]);
-    bins[i] = (int)floor((N_FFT + 1) * hz / SAMPLE_RATE);
-  }
-
-  int mel_cols = (N_FFT / 2) + 1;
-  memset(melFilterbank, 0, N_MELS * mel_cols * sizeof(float));
-
-  for (int m = 0; m < N_MELS; m++) {
-    int leftBin = bins[m];
-    int centerBin = bins[m + 1];
-    int rightBin = bins[m + 2];
-
-    for (int k = leftBin; k < centerBin; k++) {
-      if (k < mel_cols) {
-        melFilterbank[m * mel_cols + k] = (float)(k - leftBin) / (centerBin - leftBin);
-      }
-    }
-
-    for (int k = centerBin; k < rightBin; k++) {
-      if (k < mel_cols) {
-        melFilterbank[m * mel_cols + k] = (float)(rightBin - k) / (rightBin - centerBin);
-      }
-    }
-  }
-}
-
-void initDCTMatrix() {
-  for (int i = 0; i < N_MFCC; i++) {
-    for (int j = 0; j < N_MELS; j++) {
-      dctMatrix[i * N_MELS + j] = cos(PI * i * (j + 0.5f) / N_MELS) * sqrt(2.0f / N_MELS);
-    }
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// EXTRACCION DE MFCC
-// ═══════════════════════════════════════════════════════════════════════════
-
-void extractFrameMFCC(int frameIndex, float* mfccs) {
-  int offset = frameIndex * HOP_LENGTH;
-  int mel_cols = (N_FFT / 2) + 1;
-
-  // 1. Aplicar ventana Hamming y copiar a buffer FFT
-  for (int i = 0; i < N_FFT; i++) {
-    if (offset + i < AUDIO_SAMPLES) {
-      vReal[i] = audioBuffer[offset + i] * hammingWindow[i];
-    } else {
-      vReal[i] = 0;
-    }
-    vImag[i] = 0;
-  }
-
-  // 2. FFT
-  FFT.compute(vReal, vImag, N_FFT, FFTDirection::Forward);
-
-  // 3. Magnitud (power spectrum) - reusar vReal para ahorrar memoria
-  for (int i = 0; i < mel_cols; i++) {
-    vReal[i] = sqrt(vReal[i] * vReal[i] + vImag[i] * vImag[i]);
-  }
-
-  // 4. Aplicar Mel filterbank - reusar vImag para mel energies
-  for (int m = 0; m < N_MELS; m++) {
-    float energy = 0.0f;
-    for (int k = 0; k < mel_cols; k++) {
-      energy += vReal[k] * melFilterbank[m * mel_cols + k];
-    }
-    vImag[m] = log(energy + 1e-10f);
-  }
-
-  // 5. DCT para obtener MFCCs
-  for (int i = 0; i < N_MFCC; i++) {
-    float sum = 0.0f;
-    for (int j = 0; j < N_MELS; j++) {
-      sum += vImag[j] * dctMatrix[i * N_MELS + j];
-    }
-    mfccs[i] = sum;
-  }
-}
-
-void processAudioToMFCC() {
-  Serial.println("\n[MFCC] Procesando audio...");
-  unsigned long startMFCC = millis();
-
-  float frameMFCCs[N_MFCC];
-
-  for (int frame = 0; frame < N_FRAMES; frame++) {
-    extractFrameMFCC(frame, frameMFCCs);
-
-    // Normalizar y guardar en formato (N_MFCC, N_FRAMES)
-    for (int i = 0; i < N_MFCC; i++) {
-      mfccOutput[i * N_FRAMES + frame] = (frameMFCCs[i] - MFCC_MEAN) / MFCC_STD;
-    }
-
-    if (frame % 25 == 0) {
-      Serial.printf("   Frame %d/%d\n", frame, N_FRAMES);
-    }
-  }
-
-  unsigned long elapsed = millis() - startMFCC;
-  Serial.printf("   Completado en %lu ms\n", elapsed);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// MEMORY PROFILING
-// ═══════════════════════════════════════════════════════════════════════════
-
-void runMemoryProfiling() {
-  Serial.println("\n");
-  printSeparator();
-  Serial.println("FASE 1: MEMORY PROFILING");
-  printSeparator();
-
-  printMemoryStatus("ESTADO INICIAL");
-
-  size_t psram_initial = getFreePSRAM();
-  size_t dram_initial = getFreeHeap();
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // INFO DE FLASH/LittleFS
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[FLASH INFO]");
-  printSubSeparator();
-
-  if (!LittleFS.begin(true)) {
-    Serial.println("   ERROR: No se pudo montar LittleFS");
-    return;
-  }
-
-  size_t flash_total = LittleFS.totalBytes();
-  size_t flash_used = LittleFS.usedBytes();
-  Serial.printf("   LittleFS Total:  %7d KB\n", flash_total / 1024);
-  Serial.printf("   LittleFS Usado:  %7d KB\n", flash_used / 1024);
-  Serial.printf("   LittleFS Libre:  %7d KB\n", (flash_total - flash_used) / 1024);
-
-  // Registrar modelo en Flash (no se aloca, solo se lee)
-  File modelFile = LittleFS.open(MODEL_PATH, "r");
-  if (!modelFile) {
-    Serial.printf("   ERROR: No se pudo abrir %s\n", MODEL_PATH);
-    return;
-  }
-  modelSize = modelFile.size();
-  Serial.printf("   Modelo en Flash: %7.1f KB (%s)\n", modelSize / 1024.0f, MODEL_PATH);
-
-  // Registrar que el modelo está en Flash
-  allocateAndTrack("modelo (flash)", "uint8_t[]", modelSize, MEM_FLASH);
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // AUDIO BUFFERS -> PSRAM
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[AUDIO -> PSRAM]");
-  printSubSeparator();
-
-  size_t audio_size = AUDIO_SAMPLES * sizeof(int16_t);
-  audioBuffer = (int16_t*)allocateAndTrack("audioBuffer", "int16_t[]", audio_size, MEM_PSRAM);
-  Serial.printf("   audioBuffer[%d]: %d KB -> %s\n", AUDIO_SAMPLES, audio_size / 1024,
-                audioBuffer ? "OK" : "FALLO");
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // MFCC BUFFERS -> PSRAM
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[MFCC -> PSRAM]");
-  printSubSeparator();
-
-  size_t mfcc_output_size = N_MFCC * N_FRAMES * sizeof(float);
-  mfccOutput = (float*)allocateAndTrack("mfccOutput", "float[]", mfcc_output_size, MEM_PSRAM);
-  Serial.printf("   mfccOutput[%dx%d]: %.1f KB -> %s\n", N_MFCC, N_FRAMES,
-                mfcc_output_size / 1024.0f, mfccOutput ? "OK" : "FALLO");
-
-  size_t vreal_size = N_FFT * sizeof(float);
-  vReal = (float*)allocateAndTrack("vReal", "float[]", vreal_size, MEM_PSRAM);
-  Serial.printf("   vReal[%d]: %.1f KB -> %s\n", N_FFT, vreal_size / 1024.0f, vReal ? "OK" : "FALLO");
-
-  size_t vimag_size = N_FFT * sizeof(float);
-  vImag = (float*)allocateAndTrack("vImag", "float[]", vimag_size, MEM_PSRAM);
-  Serial.printf("   vImag[%d]: %.1f KB -> %s\n", N_FFT, vimag_size / 1024.0f, vImag ? "OK" : "FALLO");
-
-  int mel_cols = (N_FFT / 2) + 1;
-  size_t mel_size = N_MELS * mel_cols * sizeof(float);
-  melFilterbank = (float*)allocateAndTrack("melFilterbank", "float[]", mel_size, MEM_PSRAM);
-  Serial.printf("   melFilterbank[%dx%d]: %.1f KB -> %s\n", N_MELS, mel_cols,
-                mel_size / 1024.0f, melFilterbank ? "OK" : "FALLO");
-
-  size_t dct_size = N_MFCC * N_MELS * sizeof(float);
-  dctMatrix = (float*)allocateAndTrack("dctMatrix", "float[]", dct_size, MEM_PSRAM);
-  Serial.printf("   dctMatrix[%dx%d]: %.1f KB -> %s\n", N_MFCC, N_MELS,
-                dct_size / 1024.0f, dctMatrix ? "OK" : "FALLO");
-
-  size_t hamming_size = N_FFT * sizeof(float);
-  hammingWindow = (float*)allocateAndTrack("hammingWindow", "float[]", hamming_size, MEM_PSRAM);
-  Serial.printf("   hammingWindow[%d]: %.1f KB -> %s\n", N_FFT,
-                hamming_size / 1024.0f, hammingWindow ? "OK" : "FALLO");
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // TFLITE -> PSRAM (modelo se copia de Flash a PSRAM)
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[TFLITE -> PSRAM]");
-  printSubSeparator();
-
-  Serial.println("   Copiando modelo de Flash a PSRAM...");
-  modelBuffer = (uint8_t*)allocateAndTrack("modelBuffer", "uint8_t[]", modelSize, MEM_PSRAM);
-
-  if (modelBuffer) {
-    modelFile.read(modelBuffer, modelSize);
-    Serial.printf("   modelBuffer: %.1f KB -> OK\n", modelSize / 1024.0f);
-  } else {
-    Serial.println("   modelBuffer: FALLO");
-  }
-  modelFile.close();
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // BUSQUEDA DE ARENA OPTIMO (descendente, conservadora)
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[BUSQUEDA ARENA - Descendente]");
-  printSubSeparator();
-
-  model = tflite::GetModel(modelBuffer);
-  if (model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.println("   ERROR: Version de modelo incompatible");
-    return;
-  }
-
-  static tflite::MicroMutableOpResolver<11> resolver;
-  resolver.AddConv2D();
-  resolver.AddMaxPool2D();
-  resolver.AddAveragePool2D();
-  resolver.AddMean();
-  resolver.AddFullyConnected();
-  resolver.AddSoftmax();
-  resolver.AddReshape();
-  resolver.AddQuantize();
-  resolver.AddDequantize();
-  resolver.AddMul();
-  resolver.AddAdd();
-
-  static tflite::MicroErrorReporter micro_error_reporter;
-
-  // Busqueda descendente: empezar alto y bajar hasta que falle
-  // Esto evita que TFLite haga abort() por falta de memoria
-  size_t test_sizes[] = {512, 384, 256, 192, 160, 144, 136, 132, 130, 128};
-  int num_tests = sizeof(test_sizes) / sizeof(test_sizes[0]);
-  arena_optimal = 512 * 1024; // default si todo falla
-
-  Serial.println("   Probando tamaños (descendente):");
-
-  for (int i = 0; i < num_tests; i++) {
-    size_t arena_test = test_sizes[i] * 1024;
-
-    uint8_t* test_arena = (uint8_t*)heap_caps_aligned_alloc(16, arena_test, MALLOC_CAP_SPIRAM);
-    if (!test_arena) {
-      Serial.printf("   [%2d] %4d KB -> Sin memoria PSRAM\n", i+1, test_sizes[i]);
-      continue;
-    }
-
-    tflite::MicroInterpreter test_interpreter(model, resolver, test_arena, arena_test, &micro_error_reporter);
-    TfLiteStatus status = test_interpreter.AllocateTensors();
-
-    heap_caps_free(test_arena);
-
-    if (status == kTfLiteOk) {
-      Serial.printf("   [%2d] %4d KB -> OK\n", i+1, test_sizes[i]);
-      arena_optimal = arena_test;
-      // Continuar para encontrar el mínimo
-    } else {
-      Serial.printf("   [%2d] %4d KB -> Fallo (muy pequeño)\n", i+1, test_sizes[i]);
-      // Parar aquí - el anterior era el mínimo funcional
-      break;
-    }
-  }
-
-  // Usar 20% de margen para seguridad (TFLite puede abortar con valores límite)
-  size_t arena_with_margin = ((arena_optimal + (arena_optimal / 5)) / 16) * 16;
-
-  Serial.printf("\n   RESULTADO:\n");
-  Serial.printf("   Arena minimo:      %4d KB\n", arena_optimal / 1024);
-  Serial.printf("   Arena con +20%%:    %4d KB (recomendado)\n", arena_with_margin / 1024);
-
-  tensor_arena = (uint8_t*)allocateAndTrack("kTensorArena", "uint8_t[]", arena_with_margin, MEM_PSRAM);
-  Serial.printf("   kTensorArena: %.1f KB -> %s\n", arena_with_margin / 1024.0f,
-                tensor_arena ? "OK" : "FALLO");
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // TABLA DE ALLOCACIONES
-  // ═══════════════════════════════════════════════════════════════════════
-  printAllocationTable();
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // RESUMEN FINAL
-  // ═══════════════════════════════════════════════════════════════════════
-  printMemoryStatus("ESTADO FINAL");
-
-  size_t psram_final = getFreePSRAM();
-  size_t dram_final = getFreeHeap();
-
-  Serial.println("\n[DELTA DE MEMORIA]");
-  printSubSeparator();
-  Serial.printf("   PSRAM consumida:   %7d KB (%.1f%% del total)\n",
-                (psram_initial - psram_final) / 1024,
-                ((psram_initial - psram_final) * 100.0f) / getTotalPSRAM());
-  Serial.printf("   DRAM consumida:    %7d KB\n", (dram_initial - dram_final) / 1024);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// PIPELINE COMPLETO CON DATOS DUMMY
-// ═══════════════════════════════════════════════════════════════════════════
-
-void runDummyPipeline() {
-  Serial.println("\n");
-  printSeparator();
-  Serial.println("FASE 2: PIPELINE CON RUIDO ALEATORIO");
-  printSeparator();
-
-  unsigned long t_start, t_phase_start;
-  t_phase_start = millis();
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // PASO 1: Generar ruido aleatorio (simula 4s de captura)
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[1/5] GENERAR RUIDO (simula captura audio)");
-  printSubSeparator();
-  t_start = millis();
-
-  for (int i = 0; i < AUDIO_SAMPLES; i++) {
-    audioBuffer[i] = (int16_t)(random(-16000, 16000));
-  }
-
-  timings.gen_noise = millis() - t_start;
-  Serial.printf("   Samples:     %d\n", AUDIO_SAMPLES);
-  Serial.printf("   Tiempo:      %lu ms\n", timings.gen_noise);
-  Serial.printf("   Nota: En produccion seran 4000 ms de captura real\n");
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // PASO 2: Inicializar matrices MFCC
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[2/5] INICIALIZAR MATRICES MFCC");
-  printSubSeparator();
-  t_start = millis();
-
-  initHammingWindow();
-  initMelFilterbank();
-  initDCTMatrix();
-
-  timings.init_matrices = millis() - t_start;
-  Serial.printf("   Hamming:     %d puntos\n", N_FFT);
-  Serial.printf("   Mel bank:    %d x %d\n", N_MELS, (N_FFT/2)+1);
-  Serial.printf("   DCT:         %d x %d\n", N_MFCC, N_MELS);
-  Serial.printf("   Tiempo:      %lu ms\n", timings.init_matrices);
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // PASO 3: Extraer MFCCs
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[3/5] EXTRAER MFCCs");
-  printSubSeparator();
-  t_start = millis();
-
-  processAudioToMFCC();
-
-  timings.mfcc_extract = millis() - t_start;
-
-  // Stats de los MFCCs
-  float mfcc_min = 1e10, mfcc_max = -1e10, mfcc_sum = 0;
-  for (int i = 0; i < N_MFCC * N_FRAMES; i++) {
-    float v = mfccOutput[i];
-    if (v < mfcc_min) mfcc_min = v;
-    if (v > mfcc_max) mfcc_max = v;
-    mfcc_sum += v;
-  }
-  float mfcc_mean = mfcc_sum / (N_MFCC * N_FRAMES);
-
-  Serial.printf("   Output:      %d x %d = %d valores\n", N_MFCC, N_FRAMES, N_MFCC * N_FRAMES);
-  Serial.printf("   Rango:       [%.2f, %.2f]\n", mfcc_min, mfcc_max);
-  Serial.printf("   Media:       %.4f\n", mfcc_mean);
-  Serial.printf("   Tiempo:      %lu ms (%.1f ms/frame)\n", timings.mfcc_extract,
-                timings.mfcc_extract / (float)N_FRAMES);
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // PASO 4: Preparar y llenar input tensor
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[4/5] PREPARAR INFERENCIA");
-  printSubSeparator();
-
-  static tflite::MicroMutableOpResolver<11> resolver2;
-  resolver2.AddConv2D();
-  resolver2.AddMaxPool2D();
-  resolver2.AddAveragePool2D();
-  resolver2.AddMean();
-  resolver2.AddFullyConnected();
-  resolver2.AddSoftmax();
-  resolver2.AddReshape();
-  resolver2.AddQuantize();
-  resolver2.AddDequantize();
-  resolver2.AddMul();
-  resolver2.AddAdd();
-
-  static tflite::MicroErrorReporter micro_error_reporter2;
-
-  size_t arena_size = allocation_count > 0 ? allocations[allocation_count - 1].size_bytes : 256 * 1024;
-
-  static tflite::MicroInterpreter static_interpreter(
-      model, resolver2, tensor_arena, arena_size, &micro_error_reporter2);
-  interpreter = &static_interpreter;
-
-  if (interpreter->AllocateTensors() != kTfLiteOk) {
-    Serial.println("   ERROR: No se pudo asignar tensors");
-    return;
-  }
-
-  input_tensor = interpreter->input(0);
-  output_tensor = interpreter->output(0);
-
-  Serial.printf("   Input shape:  [%d, %d, %d, %d]\n",
-                input_tensor->dims->data[0], input_tensor->dims->data[1],
-                input_tensor->dims->data[2], input_tensor->dims->data[3]);
-  Serial.printf("   Input type:   %s (scale=%.6f, zp=%d)\n",
-                input_tensor->type == kTfLiteInt8 ? "INT8" : "FLOAT32",
-                input_tensor->params.scale, input_tensor->params.zero_point);
-  Serial.printf("   Output shape: [%d, %d]\n",
-                output_tensor->dims->data[0], output_tensor->dims->data[1]);
-
-  // Llenar input tensor
-  Serial.println("\n   Quantizando MFCCs a INT8...");
-  t_start = millis();
-
-  float input_scale = input_tensor->params.scale;
-  int input_zero_point = input_tensor->params.zero_point;
-
-  for (int mfcc_idx = 0; mfcc_idx < N_MFCC; mfcc_idx++) {
-    for (int frame_idx = 0; frame_idx < N_FRAMES; frame_idx++) {
-      float value = mfccOutput[mfcc_idx * N_FRAMES + frame_idx];
-      int32_t quantized = (int32_t)round(value / input_scale) + input_zero_point;
-      quantized = constrain(quantized, -128, 127);
-      input_tensor->data.int8[mfcc_idx * N_FRAMES + frame_idx] = (int8_t)quantized;
-    }
-  }
-
-  timings.fill_input = millis() - t_start;
-  Serial.printf("   Tiempo fill: %lu ms\n", timings.fill_input);
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // PASO 5: Ejecutar inferencia
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n[5/5] EJECUTAR INFERENCIA");
-  printSubSeparator();
-
-  printMemoryStatus("PRE-INVOKE");
-
-  esp_task_wdt_init(120, false);
-  Cache_WriteBack_All();
-  delay(50);
-
-  Serial.println("\n   Ejecutando Invoke()...");
-  t_start = millis();
-  TfLiteStatus invoke_status = interpreter->Invoke();
-  timings.invoke = millis() - t_start;
-
-  esp_task_wdt_init(5, true);
-
-  if (invoke_status != kTfLiteOk) {
-    Serial.println("   ERROR: Invoke() fallo!");
-    return;
-  }
-
-  Serial.printf("   Invoke OK:   %lu ms\n", timings.invoke);
-
-  printMemoryStatus("POST-INVOKE");
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // RESULTADOS
-  // ═══════════════════════════════════════════════════════════════════════
-  Serial.println("\n");
-  printSeparator();
-  Serial.println("RESULTADO DE INFERENCIA");
-  printSeparator();
-
-  float output_scale = output_tensor->params.scale;
-  int output_zero_point = output_tensor->params.zero_point;
-
-  Serial.printf("\n   Output quantization: scale=%.6f, zp=%d\n\n", output_scale, output_zero_point);
-
-  int max_idx = 0;
-  float max_prob = -1000.0f;
-
-  Serial.println("   ┌────────────┬──────────┬───────────┐");
-  Serial.println("   │ Emocion    │ Prob (%) │ Raw INT8  │");
-  Serial.println("   ├────────────┼──────────┼───────────┤");
-
-  for (int i = 0; i < EXPECTED_NUM_EMOTIONS; i++) {
-    int8_t quant_value = output_tensor->data.int8[i];
-    float prob = (quant_value - output_zero_point) * output_scale;
-
-    Serial.printf("   │ %-10s │ %7.2f%% │ %9d │\n",
-                  emotion_labels[i], prob * 100, quant_value);
-
-    if (prob > max_prob) {
-      max_prob = prob;
-      max_idx = i;
-    }
-  }
-
-  Serial.println("   └────────────┴──────────┴───────────┘");
-  Serial.printf("\n   >> PREDICCION: %s (%.1f%%)\n", emotion_labels[max_idx], max_prob * 100);
-  Serial.println("   >> (Resultado dummy - entrada es ruido aleatorio)");
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // TABLA DE TIEMPOS
-  // ═══════════════════════════════════════════════════════════════════════
-  timings.total = millis() - t_phase_start;
-
-  Serial.println("\n");
-  printSeparator();
-  Serial.println("RESUMEN DE TIEMPOS");
-  printSeparator();
-
-  unsigned long t_proceso = timings.init_matrices + timings.mfcc_extract + timings.fill_input + timings.invoke;
-
-  Serial.println("\n   ┌─────────────────────────┬──────────┬─────────┐");
-  Serial.println("   │ Etapa                   │ Tiempo   │ % Total │");
-  Serial.println("   ├─────────────────────────┼──────────┼─────────┤");
-  Serial.printf("   │ Generar ruido (dummy)   │ %5lu ms │ %5.1f%% │\n",
-                timings.gen_noise, timings.gen_noise * 100.0f / timings.total);
-  Serial.printf("   │ Init matrices MFCC      │ %5lu ms │ %5.1f%% │\n",
-                timings.init_matrices, timings.init_matrices * 100.0f / timings.total);
-  Serial.printf("   │ Extraer MFCCs           │ %5lu ms │ %5.1f%% │\n",
-                timings.mfcc_extract, timings.mfcc_extract * 100.0f / timings.total);
-  Serial.printf("   │ Fill input tensor       │ %5lu ms │ %5.1f%% │\n",
-                timings.fill_input, timings.fill_input * 100.0f / timings.total);
-  Serial.printf("   │ Invoke() inferencia     │ %5lu ms │ %5.1f%% │\n",
-                timings.invoke, timings.invoke * 100.0f / timings.total);
-  Serial.println("   ├─────────────────────────┼──────────┼─────────┤");
-  Serial.printf("   │ TOTAL                   │ %5lu ms │ 100.0%% │\n", timings.total);
-  Serial.println("   └─────────────────────────┴──────────┴─────────┘");
-
-  Serial.println("\n   PROYECCION PARA PRODUCCION:");
-  Serial.printf("   - Captura audio real:  4000 ms (fijo)\n");
-  Serial.printf("   - Procesamiento:       %4lu ms\n", t_proceso);
-  Serial.printf("   - CICLO TOTAL:         %4lu ms (%.1f seg)\n",
-                4000 + t_proceso, (4000 + t_proceso) / 1000.0f);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// SETUP Y LOOP
-// ═══════════════════════════════════════════════════════════════════════════
+// -----------------------------------------------------------------------------
+// Setup
+// -----------------------------------------------------------------------------
 
 void setup() {
-  Serial.begin(115200);
-  delay(2000);
+    Serial.begin(115200);
+    delay(2000);
 
-  Serial.println("\n\n");
-  printSeparator();
-  Serial.println("MoodLink - Test 4: Memory Profiling + Pipeline Dummy");
-  printSeparator();
-  Serial.printf("VERSION: %s\n", VERSION);
-  Serial.printf("Modelo:  %s\n", MODEL_PATH);
-  printSeparator();
+    print_separator();
+    Serial.println("MoodLink - Test 5.3: Pipeline con Profiling");
+    Serial.printf("Version: %s\n", VERSION);
+    Serial.printf("CSV Output: %s\n", CSV_FILENAME);
+    print_separator();
 
-  Serial.println("\nConfiguracion del Pipeline:");
-  Serial.printf("  Audio:  %d Hz x %d seg = %d samples\n", SAMPLE_RATE, AUDIO_DURATION_SEC, AUDIO_SAMPLES);
-  Serial.printf("  MFCC:   %d coefs x %d frames (HOP=%d)\n", N_MFCC, N_FRAMES, HOP_LENGTH);
-  Serial.printf("  FFT:    %d puntos, %d mel bands\n", N_FFT, N_MELS);
-  Serial.printf("  Output: %d emociones\n", EXPECTED_NUM_EMOTIONS);
+    // Guardar PSRAM inicial
+    init_memory.psram_initial_kb = get_psram_free_kb();
+    Serial.printf("\n[MEMORIA] PSRAM inicial: %u KB\n", init_memory.psram_initial_kb);
 
-  delay(1000);
+    // -------------------------------------------------------------------------
+    // 1. Alocar buffers del pipeline
+    // -------------------------------------------------------------------------
+    Serial.println("\n[1/5] Alocando buffers...");
 
-  // FASE 1: Memory profiling
-  runMemoryProfiling();
+    size_t audio_size = AUDIO_SAMPLES * sizeof(int16_t);
+    size_t mfcc_size = N_MFCC * N_FRAMES * sizeof(float);
 
-  delay(2000);
+    audio_buffer = (int16_t*)heap_caps_aligned_alloc(
+        16, audio_size, MALLOC_CAP_SPIRAM);
 
-  // FASE 2: Pipeline con datos dummy
-  runDummyPipeline();
+    mfcc_buffer = (float*)heap_caps_aligned_alloc(
+        16, mfcc_size, MALLOC_CAP_SPIRAM);
 
-  Serial.println("\n");
-  printSeparator();
-  Serial.println("TEST 4 FINALIZADO");
-  printSeparator();
-  Serial.println("\nValores listos para Test 5 (Pipeline con audio real)");
+    if (!audio_buffer || !mfcc_buffer) {
+        Serial.println("ERROR: No se pudieron alocar buffers");
+        while (1) delay(1000);
+    }
+
+    init_memory.audio_buffer_kb = audio_size / 1024.0f;
+    init_memory.mfcc_buffer_kb = mfcc_size / 1024.0f;
+
+    Serial.printf("  audio_buffer: %.1f KB\n", init_memory.audio_buffer_kb);
+    Serial.printf("  mfcc_buffer:  %.1f KB\n", init_memory.mfcc_buffer_kb);
+
+    // -------------------------------------------------------------------------
+    // 2. Inicializar módulos
+    // -------------------------------------------------------------------------
+    Serial.println("\n[2/5] Inicializando audio...");
+    if (!audio_init()) {
+        Serial.println("ERROR: Fallo audio_init()");
+        while (1) delay(1000);
+    }
+
+    Serial.println("\n[3/5] Inicializando MFCC...");
+    if (!mfcc_init()) {
+        Serial.println("ERROR: Fallo mfcc_init()");
+        while (1) delay(1000);
+    }
+    init_memory.mfcc_internal_kb = mfcc_get_internal_memory_bytes() / 1024.0f;
+    Serial.printf("  MFCC internal: %.1f KB\n", init_memory.mfcc_internal_kb);
+
+    Serial.println("\n[4/5] Cargando modelo...");
+    if (!model_load(MODEL_PATH)) {
+        Serial.println("ERROR: Fallo model_load()");
+        while (1) delay(1000);
+    }
+    init_memory.model_buffer_kb = model_get_size_bytes() / 1024.0f;
+    init_memory.tensor_arena_kb = model_get_arena_size_bytes() / 1024.0f;
+    Serial.printf("  Model: %.1f KB  |  Arena: %.1f KB\n",
+                  init_memory.model_buffer_kb, init_memory.tensor_arena_kb);
+
+    // Calcular memoria total
+    init_memory.psram_after_init_kb = get_psram_free_kb();
+    init_memory.total_allocated_kb = init_memory.psram_initial_kb - init_memory.psram_after_init_kb;
+
+    // -------------------------------------------------------------------------
+    // 5. Inicializar profiler
+    // -------------------------------------------------------------------------
+    Serial.println("\n[5/5] Inicializando profiler...");
+    if (!profiler_init(CSV_FILENAME)) {
+        Serial.println("ERROR: Fallo profiler_init()");
+        while (1) delay(1000);
+    }
+
+    // Guardar y mostrar perfil de memoria inicial
+    profiler_log_init_memory(init_memory);
+    profiler_print_init_memory(init_memory);
+
+    Serial.println("\n========== SISTEMA LISTO ==========");
+    Serial.printf("Iteraciones previas en CSV: %d\n", profiler_get_row_count());
+    print_help();
 }
 
+// -----------------------------------------------------------------------------
+// Comandos Serial
+// -----------------------------------------------------------------------------
+
+static void print_help() {
+    Serial.println("\n=== COMANDOS DISPONIBLES ===");
+    Serial.println("  d, dump   - Exportar CSV al Serial");
+    Serial.println("  r, reset  - Borrar CSV y empezar de nuevo");
+    Serial.println("  c, count  - Mostrar cantidad de iteraciones");
+    Serial.println("  s, skip   - Saltar espera e iniciar grabación");
+    Serial.println("  h, help   - Mostrar esta ayuda");
+    Serial.println("  p, pause  - Pausar/reanudar el loop");
+    Serial.println("============================\n");
+}
+
+static bool paused = false;
+
+static void handle_serial_commands() {
+    while (Serial.available()) {
+        char cmd = Serial.read();
+
+        switch (cmd) {
+            case 'd':
+                profiler_dump_csv();
+                break;
+            case 'r':
+                profiler_reset_csv();
+                iteration_count = 0;
+                break;
+            case 'c':
+                Serial.printf("[Profiler] Iteraciones en CSV: %d\n", profiler_get_row_count());
+                break;
+            case 'h':
+                print_help();
+                break;
+            case 'p':
+                paused = !paused;
+                Serial.printf("[Sistema] %s\n", paused ? "PAUSADO" : "REANUDADO");
+                break;
+            case 's':
+                // Se maneja en el loop
+                break;
+            case '\n':
+            case '\r':
+                // Ignorar
+                break;
+            default:
+                Serial.printf("[?] Comando '%c' no reconocido. Usa 'h' para ayuda.\n", cmd);
+                break;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Loop - Pipeline principal con profiling
+// -----------------------------------------------------------------------------
+
 void loop() {
-  delay(10000);
+    // Procesar comandos Serial
+    handle_serial_commands();
+
+    // Si está pausado, solo procesar comandos
+    if (paused) {
+        delay(100);
+        return;
+    }
+
+    iteration_count++;
+
+    Serial.printf("\n*** Iteración #%u - Preparate para hablar (3 seg, 's' para saltar) ***\n", iteration_count);
+
+    // Espera con opción de saltar
+    for (int i = 0; i < 30; i++) {  // 30 * 100ms = 3 segundos
+        delay(100);
+        if (Serial.available() && Serial.peek() == 's') {
+            Serial.read();  // Consumir el 's'
+            Serial.println("[!] Saltando espera...");
+            break;
+        }
+    }
+
+    // Estructura para métricas de esta iteración
+    PipelineMetrics metrics = {0};
+    metrics.iteration = iteration_count;
+    metrics.timestamp_ms = millis();
+
+    // Memoria al inicio de la iteración
+    metrics.psram_free_kb = get_psram_free_kb();
+    metrics.psram_used_kb = get_psram_total_kb() - metrics.psram_free_kb;
+    metrics.dram_free_kb = get_dram_free_kb();
+
+    unsigned long pipeline_start = millis();
+
+    // -------------------------------------------------------------------------
+    // Etapa 1: Capturar audio
+    // -------------------------------------------------------------------------
+    unsigned long t1 = millis();
+
+    if (!audio_capture(audio_buffer)) {
+        Serial.println("ERROR: Fallo captura de audio");
+        delay(5000);
+        return;
+    }
+
+    metrics.time_capture_ms = millis() - t1;
+
+    // -------------------------------------------------------------------------
+    // Etapa 2: Normalizar
+    // -------------------------------------------------------------------------
+    unsigned long t2 = millis();
+
+    audio_normalize(audio_buffer);
+
+    metrics.time_normalize_ms = millis() - t2;
+
+    // Estadísticas de audio
+    AudioStats stats = audio_get_stats(audio_buffer);
+    metrics.audio_rms = stats.rms;
+    metrics.audio_peak_pos = stats.peak_pos;
+    metrics.audio_peak_neg = stats.peak_neg;
+
+    Serial.printf("[Audio] RMS: %.1f, Picos: [%d, %d]\n",
+                  stats.rms, stats.peak_neg, stats.peak_pos);
+
+    // -------------------------------------------------------------------------
+    // Etapa 3: Extraer MFCCs
+    // -------------------------------------------------------------------------
+    unsigned long t3 = millis();
+
+    mfcc_extract(audio_buffer, mfcc_buffer);
+
+    metrics.time_mfcc_ms = millis() - t3;
+
+    // -------------------------------------------------------------------------
+    // Etapa 4: Inferencia
+    // -------------------------------------------------------------------------
+    unsigned long t4 = millis();
+
+    EmotionResult result = model_predict(mfcc_buffer);
+
+    metrics.time_inference_ms = millis() - t4;
+
+    // -------------------------------------------------------------------------
+    // Finalizar métricas
+    // -------------------------------------------------------------------------
+    metrics.time_total_ms = millis() - pipeline_start;
+    metrics.emotion_index = result.index;
+    metrics.confidence = result.confidence;
+
+    // Guardar en CSV
+    profiler_log_iteration(metrics);
+
+    // Mostrar resultado
+    print_result(result);
+
+    // Mostrar métricas en Serial
+    profiler_print_iteration(metrics);
+
+    Serial.printf("\n[CSV] Datos guardados en %s\n", CSV_FILENAME);
+
+    // Esperar antes del próximo ciclo
+    delay(2000);
 }
